@@ -8,6 +8,8 @@ import requests
 from time import sleep
 import numpy as np
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 '''
 If you are not familiar with Python or feeling a little bit rusty, highly recommend you to go through the following link:
