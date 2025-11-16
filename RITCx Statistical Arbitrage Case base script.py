@@ -244,90 +244,44 @@ def main():
             # trade_on_div(GEAR, div_ger)
             
             # ======== Strategy 2 =========
-            def trade_on_divergence_pair(ptd_returns, divergences, beta_map):
-                """
-                Trade based on divergence pairs to create market-neutral positions.
+            # Divergence-based pair trading with beta-neutral positions
+            # Expected PTD Return_x,t = PTD Return_RSM1000,t * β_x
+            # Divergence_x,t = PTD Return_x,t - Expected PTD Return_x,t
+            
+            # Find pair with largest divergence spread
+            div_dict = {NGN: div_ngn, WHEL: div_whe, GEAR: div_ger}
+            sorted_stocks = sorted(div_dict.items(), key=lambda x: x[1])
+            
+            stock_low = sorted_stocks[0][0]   # Lowest divergence (underperforming)
+            stock_high = sorted_stocks[-1][0] # Highest divergence (overperforming)
+            div_low = sorted_stocks[0][1]
+            div_high = sorted_stocks[-1][1]
+            div_spread = div_high - div_low
+            
+            # Trade when divergence spread is significant
+            if div_spread > ENTRY_BAND_PCT * 100 and within_limits():
+                beta_low = beta_map[stock_low]
+                beta_high = beta_map[stock_high]
                 
-                Strategy:
-                - Expected PTD Return_x,t = PTD Return_RSM1000,t * β_x
-                - Divergence_x,t = PTD Return_x,t - Expected PTD Return_x,t
-                - When divergences occur, short the overperforming stock and buy the underperforming stock
-                - Size positions to maintain beta-neutral portfolio: |value_stock1 / value_stock2| = |β_stock2 / β_stock1|
-                """
-                stocks = [NGN, WHEL, GEAR]
-                stock_data = []
-                
-                for stock in stocks:
-                    if stock in ptd_returns and stock in divergences and stock in beta_map:
-                        stock_data.append({
-                            'ticker': stock,
-                            'ptd_return': ptd_returns[stock],
-                            'divergence': divergences[stock],
-                            'beta': beta_map[stock]
-                        })
-                
-                # Sort by divergence to find pairs
-                stock_data.sort(key=lambda x: x['divergence'])
-                
-                # Find pairs with significant divergences
-                for i in range(len(stock_data)):
-                    for j in range(i + 1, len(stock_data)):
-                        stock1 = stock_data[i]  # Lower divergence (underperforming)
-                        stock2 = stock_data[j]  # Higher divergence (overperforming)
+                if beta_low != 0 and beta_high != 0:
+                    # Calculate position sizes for beta neutrality
+                    # |value_low / value_high| = |β_high / β_low|
+                    base_value = 10000  # Short position value
+                    long_value = base_value * abs(beta_high / beta_low)
+                    
+                    # Get current prices
+                    mid_low = mid_price(stock_low)
+                    mid_high = mid_price(stock_high)
+                    
+                    if mid_low and mid_high:
+                        shares_low = int(long_value / mid_low)
+                        shares_high = int(base_value / mid_high)
                         
-                        # Check if divergences are significant enough
-                        div_diff = stock2['divergence'] - stock1['divergence']
-                        if div_diff > ENTRY_BAND_PCT * 100:  # Convert to percentage points
-                            # Calculate position sizes to maintain beta neutrality
-                            # |value_stock1 / value_stock2| = |β_stock2 / β_stock1|
-                            # We want to BUY stock1 (underperforming) and SELL stock2 (overperforming)
-                            
-                            beta1 = stock1['beta']
-                            beta2 = stock2['beta']
-                            
-                            if beta1 != 0 and beta2 != 0:
-                                # Base position value (e.g., $10,000)
-                                base_value = 10000
-                                
-                                # Calculate position sizes based on beta ratio
-                                # For beta neutrality: value1 * beta1 + value2 * beta2 ≈ 0
-                                # If we short stock2 with value V2, we need to buy stock1 with value V1
-                                # such that: V1 * beta1 - V2 * beta2 ≈ 0
-                                # Therefore: V1 / V2 = beta2 / beta1
-                                
-                                value2 = base_value  # Short position value
-                                value1 = value2 * abs(beta2 / beta1)  # Long position value
-                                
-                                # Get current prices to calculate share quantities
-                                mid1 = mid_price(stock1['ticker'])
-                                mid2 = mid_price(stock2['ticker'])
-                                
-                                if mid1 and mid2 and within_limits():
-                                    shares1 = int(value1 / mid1)
-                                    shares2 = int(value2 / mid2)
-                                    
-                                    # Place orders: BUY underperforming, SELL overperforming
-                                    place_mkt(stock1['ticker'], "BUY", shares1)
-                                    place_mkt(stock2['ticker'], "SELL", shares2)
-                                    
-                                    if PRINT_HEARTBEAT:
-                                        print(f"PAIR TRADE: BUY {shares1} {stock1['ticker']} (div={stock1['divergence']:.2f}%), "
-                                              f"SELL {shares2} {stock2['ticker']} (div={stock2['divergence']:.2f}%)")
-                                    break  # Only one pair trade per tick
-            
-            # Calculate PTD returns and divergences for Strategy 2
-            ptd_returns_dict = {
-                NGN: ptd_ngn,
-                WHEL: ptd_whe,
-                GEAR: ptd_ger
-            }
-            divergences_dict = {
-                NGN: div_ngn,
-                WHEL: div_whe,
-                GEAR: div_ger
-            }
-            
-            trade_on_divergence_pair(ptd_returns_dict, divergences_dict, beta_map)
+                        # BUY underperforming, SELL overperforming
+                        if shares_low > 0:
+                            place_mkt(stock_low, "BUY", shares_low)
+                        if shares_high > 0:
+                            place_mkt(stock_high, "SELL", shares_high)
 
         sleep(SLEEP_SEC)
         tick, status = get_tick_status()
