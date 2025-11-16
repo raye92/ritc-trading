@@ -30,10 +30,11 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from time import sleep
 import matplotlib.pyplot as plt
+import os
 
 # ========= CONFIG =========
 API = "http://localhost:9999/v1"
-API_KEY = "Rotman"
+API_KEY = os.getenv("API_KEY", "Rotman")
 HDRS = {"X-API-key": API_KEY}
 
 NGN, WHEL, GEAR, RSM1000 = "NGN", "WHEL", "GEAR", "RSM1000"

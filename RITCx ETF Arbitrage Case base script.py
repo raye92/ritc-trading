@@ -7,6 +7,7 @@ All rights reserved.
 import requests
 from time import sleep
 import numpy as np
+import os
 
 '''
 If you are not familiar with Python or feeling a little bit rusty, highly recommend you to go through the following link:
@@ -23,7 +24,7 @@ and maximize returns.
 '''
 
 API = "http://localhost:9999/v1"
-API_KEY = "Rotman"                     # <-- your key
+API_KEY = os.getenv("API_KEY", "Rotman")         # <-- your key
 HDRS = {"X-API-key": API_KEY}          # change to X-API-Key if your server needs it
 
 # Tickers
