@@ -48,7 +48,7 @@ MAX_TRADE_SIZE  = 10_000
 GROSS_LIMIT_SH  = 500_000
 NET_LIMIT_SH    = 100_000
 ENTRY_BAND_PCT  = 0.10   # enter if |div| > 0.50%
-EXIT_BAND_PCT   = -0.1   # flatten if |div| < 0.20%
+EXIT_BAND_PCT   = 0.1   # flatten if |div| < 0.20%
 SLEEP_SEC       = 0.25
 PRINT_HEARTBEAT = True
 
@@ -148,14 +148,22 @@ def print_three_tables_and_betas(df_hist):
     return beta_map
 
 # ========= DYNAMIC PLOT (single figure, 3 lines) =========
-def init_live_plot():
+def init_live_plot(hist_ticks=None, hist_ngn=None, hist_whel=None, hist_gear=None, beta_map=None):
     plt.ion()  # interactive mode on
     fig, ax = plt.subplots()
-    # create 3 empty lines
-    line_ngn,  = ax.plot([], [], label="NGN")
-    line_whel, = ax.plot([], [], label="WHEL")
-    line_gear, = ax.plot([], [], label="GEAR")
-    ax.set_title(r"Live Divergence vs Expected PTD ($\beta$ × RSM1000)")
+    # plot historical lines if provided, spaced and color-matched
+    if hist_ticks is not None and hist_ngn is not None and hist_whel is not None and hist_gear is not None:
+        ax.plot(hist_ticks[::5], hist_ngn[::5], '--', color='orange', alpha=0.3, linewidth=1.5,
+                label=f"NGN (Hist, β={beta_map['NGN']:.2f})" if beta_map else "NGN (Hist)")
+        ax.plot(hist_ticks[::5], hist_whel[::5], '--', color='blue', alpha=0.3, linewidth=1.5,
+                label=f"WHEL (Hist, β={beta_map['WHEL']:.2f})" if beta_map else "WHEL (Hist)")
+        ax.plot(hist_ticks[::5], hist_gear[::5], '--', color='green', alpha=0.3, linewidth=1.5,
+                label=f"GEAR (Hist, β={beta_map['GEAR']:.2f})" if beta_map else "GEAR (Hist)")
+    # create 3 empty lines for live data
+    line_ngn,  = ax.plot([], [], color='orange', label=f"NGN (Live, β={beta_map['NGN']:.2f})" if beta_map else "NGN (Live)")
+    line_whel, = ax.plot([], [], color='blue', label=f"WHEL (Live, β={beta_map['WHEL']:.2f})" if beta_map else "WHEL (Live)")
+    line_gear, = ax.plot([], [], color='green', label=f"GEAR (Live, β={beta_map['GEAR']:.2f})" if beta_map else "GEAR (Live)")
+    ax.set_title(r"Live & Historical Divergence vs Expected PTD ($\beta$ × RSM1000)")
     ax.set_xlabel("Tick")
     ax.set_ylabel("Divergence (%)")
     ax.grid(True)
@@ -174,6 +182,42 @@ def update_live_plot(ax, line_ngn, line_whel, line_gear, ticks, series_ngn, seri
     ax.autoscale_view()
     plt.pause(0.01)  # let GUI process events
 
+def init_price_plot(hist_ticks=None, hist_prices=None, beta_map=None):
+    plt.ion()
+    fig, ax = plt.subplots()
+    # Plot historical prices (every 5th point for spacing)
+    if hist_ticks is not None and hist_prices is not None:
+        ax.plot(hist_ticks[::5], hist_prices['NGN'][::5], '--', color='orange', alpha=0.3, linewidth=1.5,
+                label=f"NGN (Hist)")
+        ax.plot(hist_ticks[::5], hist_prices['WHEL'][::5], '--', color='blue', alpha=0.3, linewidth=1.5,
+                label=f"WHEL (Hist)")
+        ax.plot(hist_ticks[::5], hist_prices['GEAR'][::5], '--', color='green', alpha=0.3, linewidth=1.5,
+                label=f"GEAR (Hist)")
+        ax.plot(hist_ticks[::5], hist_prices['RSM1000'][::5], '--', color='black', alpha=0.3, linewidth=1.5,
+                label=f"RSM1000 (Hist)")
+    # Create empty lines for live prices
+    line_ngn,  = ax.plot([], [], color='orange', label="NGN (Live)")
+    line_whel, = ax.plot([], [], color='blue', label="WHEL (Live)")
+    line_gear, = ax.plot([], [], color='green', label="GEAR (Live)")
+    line_idx,  = ax.plot([], [], color='black', label="RSM1000 (Live)")
+    ax.set_title("Live & Historical Price History")
+    ax.set_xlabel("Tick")
+    ax.set_ylabel("Price ($)")
+    ax.grid(True)
+    ax.legend()
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+    return fig, ax, line_ngn, line_whel, line_gear, line_idx
+
+def update_price_plot(ax, line_ngn, line_whel, line_gear, line_idx, ticks, ngn, whel, gear, idx):
+    line_ngn.set_data(ticks, ngn)
+    line_whel.set_data(ticks, whel)
+    line_gear.set_data(ticks, gear)
+    line_idx.set_data(ticks, idx)
+    ax.relim()
+    ax.autoscale_view()
+    plt.pause(0.01)
+
 # ========= MAIN =========
 def main():
     # Load historical once to get betas
@@ -181,6 +225,24 @@ def main():
     if df_hist is None:
         return
     beta_map = print_three_tables_and_betas(df_hist)   # dict with betas
+
+    # Calculate historical divergences
+    hist_ticks = df_hist["Tick"].values
+    ptd_idx_hist = (df_hist["RSM1000"] / df_hist["RSM1000"].iloc[0]) - 1.0
+    ptd_ngn_hist = (df_hist["NGN"] / df_hist["NGN"].iloc[0]) - 1.0
+    ptd_whel_hist = (df_hist["WHEL"] / df_hist["WHEL"].iloc[0]) - 1.0
+    ptd_gear_hist = (df_hist["GEAR"] / df_hist["GEAR"].iloc[0]) - 1.0
+    hist_ngn = (ptd_ngn_hist - beta_map["NGN"]  * ptd_idx_hist) * 100.0
+    hist_whel = (ptd_whel_hist - beta_map["WHEL"] * ptd_idx_hist) * 100.0
+    hist_gear = (ptd_gear_hist - beta_map["GEAR"] * ptd_idx_hist) * 100.0
+
+    # Prepare historical price arrays
+    hist_prices = {
+        'NGN': df_hist['NGN'].values,
+        'WHEL': df_hist['WHEL'].values,
+        'GEAR': df_hist['GEAR'].values,
+        'RSM1000': df_hist['RSM1000'].values
+    }
 
     # Live PTD bases (first-seen mids)
     base_idx = None
@@ -192,8 +254,17 @@ def main():
     ticks = []
     div_ngn_list, div_whe_list, div_ger_list = [], [], []
 
-    # Init dynamic plot
-    fig, ax, line_ngn, line_whel, line_gear = init_live_plot()
+    # Buffers for live price plot
+    ticks_p = []
+    ngn_p, whel_p, gear_p, idx_p = [], [], [], []
+
+    # Init dynamic plot with historical data and beta values in legend
+    fig, ax, line_ngn, line_whel, line_gear = init_live_plot(
+        hist_ticks, hist_ngn, hist_whel, hist_gear, beta_map)
+
+    # Init price plot
+    fig_price, ax_price, line_ngn_p, line_whel_p, line_gear_p, line_idx_p = init_price_plot(
+        hist_ticks, hist_prices, beta_map)
 
     # Run while case active
     tick, status = get_tick_status()
@@ -232,12 +303,29 @@ def main():
             update_live_plot(ax, line_ngn, line_whel, line_gear,
                              ticks, div_ngn_list, div_whe_list, div_ger_list)
 
+            # store + update price plot
+            ticks_p.append(tick)
+            ngn_p.append(mid_ngn)
+            whel_p.append(mid_whe)
+            gear_p.append(mid_ger)
+            idx_p.append(mid_idx)
+            update_price_plot(ax_price, line_ngn_p, line_whel_p, line_gear_p, line_idx_p,
+                             ticks_p, ngn_p, whel_p, gear_p, idx_p)
+
             # trade per symbol (simple mean-reversion)
+            # ======== Strat 1 ========
             def trade_on_div(tkr, div_pct):
                 if div_pct > ENTRY_BAND_PCT and within_limits():
                     place_mkt(tkr, "SELL", ORDER_SIZE)
                 elif div_pct < -ENTRY_BAND_PCT and within_limits():
                     place_mkt(tkr, "BUY", ORDER_SIZE)
+                # ======== Strat 1.1 ========
+                elif abs(div_pct) < EXIT_BAND_PCT:
+                    pos = positions_map().get(tkr, 0)
+                    if pos > 0:
+                        place_mkt(tkr, "SELL", abs(pos))
+                    elif pos < 0:
+                        place_mkt(tkr, "BUY", abs(pos))
 
             trade_on_div(NGN,  div_ngn)
             trade_on_div(WHEL, div_whe)
