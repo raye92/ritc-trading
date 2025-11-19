@@ -47,7 +47,7 @@ TRADABLE_TICKERS = (NGN, WHEL, GEAR)
 ALL_TICKERS = TRADABLE_TICKERS + (RSM1000,)
 
 FEE_MKT = 0.01          # $/share (market)
-ORDER_SIZE      = 5000
+ORDER_SIZE      = 10000
 MAX_TRADE_SIZE  = 10_000
 GROSS_LIMIT_SH  = 500_000
 NET_LIMIT_SH    = 100_000
@@ -152,7 +152,7 @@ def print_three_tables_and_betas(df_hist):
     return beta_map
 
 # ========= COINTEGRATION HELPERS =========
-def compute_cointegrated_pairs(df_hist, tickers=TRADABLE_TICKERS, pvalue_limit=0.05):
+def compute_cointegrated_pairs(df_hist, tickers=TRADABLE_TICKERS, pvalue_limit=10):
     pairs = []
     for y_tkr, x_tkr in combinations(tickers, 2):
         series_y = df_hist[y_tkr].astype(float).values
@@ -189,12 +189,12 @@ def compute_cointegrated_pairs(df_hist, tickers=TRADABLE_TICKERS, pvalue_limit=0
         })
     return sorted(pairs, key=lambda p: p["pvalue"])
 
-def print_cointegration_results(pairs, pvalue_limit=0.05):
+def print_cointegration_results(pairs, pvalue_limit=10):
     if not pairs:
         print("\nNo valid pairs to evaluate.\n")
         return
     print("\nCointegration (ADF) Results:\n")
-    header = " Pair        |  p-value | beta    | spread σ | status"
+    header = " Pair        |  p-value | beta    | spread | status"
     print(header)
     print("-" * len(header))
     for pair in pairs:
