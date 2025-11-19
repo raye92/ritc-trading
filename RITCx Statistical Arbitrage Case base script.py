@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
 from itertools import combinations
+from dataclasses import dataclass
+from typing import Dict, Optional
 
 '''
 If you have any question about REST APIs and outputs of code please read:
@@ -53,8 +55,12 @@ GROSS_LIMIT_SH  = 500_000
 NET_LIMIT_SH    = 100_000
 ENTRY_Z         = 2.0
 EXIT_Z          = 0.5
+STOP_Z          = 4.0
+BETA_NOTIONAL   = 50_000
+DEFAULT_MAX_HOLD = 120
 SLEEP_SEC       = 0.25
 PRINT_HEARTBEAT = True
+ENABLE_COINTEGRATION = False
 
 # ========= SESSION =========
 s = requests.Session()
@@ -234,6 +240,183 @@ def flatten_pair_positions(pair_cfg):
             place_mkt(tkr, "BUY", abs(qty))
     return True
 
+# ========= BETA-NEUTRAL DIVERGENCE HELPERS =========
+@dataclass
+class BetaNeutralTrade:
+    long_ticker: str
+    short_ticker: str
+    long_qty: int
+    short_qty: int
+    long_entry: float
+    short_entry: float
+    entry_tick: int
+    exit_tick: Optional[int] = None
+    status: str = "OPEN"
+    reason: str = ""
+    realized_pnl: float = 0.0
+
+    def unrealized_pnl(self, price_map: Dict[str, float]) -> float:
+        long_price = price_map.get(self.long_ticker)
+        short_price = price_map.get(self.short_ticker)
+        if long_price is None or short_price is None:
+            return 0.0
+        return (long_price - self.long_entry) * self.long_qty + (self.short_entry - short_price) * self.short_qty
+
+    def exposure_beta(self, price_map: Dict[str, float], beta_map: Dict[str, float]) -> float:
+        long_price = price_map.get(self.long_ticker)
+        short_price = price_map.get(self.short_ticker)
+        if long_price is None or short_price is None:
+            return 0.0
+        exposures = [
+            (self.long_qty * long_price, beta_map[self.long_ticker]),
+            (-self.short_qty * short_price, beta_map[self.short_ticker])
+        ]
+        gross = sum(abs(v) for v, _ in exposures)
+        if gross == 0:
+            return 0.0
+        return sum((v / gross) * b for v, b in exposures)
+
+    def to_log_dict(self) -> Dict[str, float]:
+        return {
+            "long": self.long_ticker,
+            "short": self.short_ticker,
+            "long_qty": self.long_qty,
+            "short_qty": self.short_qty,
+            "entry_tick": self.entry_tick,
+            "exit_tick": self.exit_tick,
+            "reason": self.reason,
+            "realized_pnl": self.realized_pnl,
+        }
+
+
+def compute_ptd_returns(price_df: pd.DataFrame) -> pd.DataFrame:
+    base = price_df.iloc[0]
+    return price_df.divide(base).subtract(1.0)
+
+
+def expected_ptd_returns(ptd_df: pd.DataFrame, beta_map: Dict[str, float], index_col: str = RSM1000) -> pd.DataFrame:
+    idx_ptd = ptd_df[index_col]
+    exp = {}
+    for ticker in TRADABLE_TICKERS:
+        exp[ticker] = beta_map.get(ticker, 1.0) * idx_ptd
+    return pd.DataFrame(exp, index=ptd_df.index)
+
+
+def compute_divergence_series(ptd_df: pd.DataFrame, expected_df: pd.DataFrame) -> pd.DataFrame:
+    div = (ptd_df[TRADABLE_TICKERS] - expected_df) * 100.0
+    div.index = ptd_df.index
+    return div
+
+
+def build_divergence_history(df_hist: pd.DataFrame, beta_map: Dict[str, float]) -> pd.DataFrame:
+    prices = df_hist[["RSM1000", "NGN", "WHEL", "GEAR"]].copy()
+    ptd = compute_ptd_returns(prices)
+    expected = expected_ptd_returns(ptd, beta_map)
+    divergence = compute_divergence_series(ptd, expected)
+    divergence["Tick"] = df_hist["Tick"].values
+    return divergence.set_index("Tick")
+
+
+def estimate_half_life(series: pd.Series) -> Optional[float]:
+    clean = series.dropna()
+    if len(clean) < 30:
+        return None
+    y = clean.diff().dropna()
+    x = clean.shift(1).dropna().loc[y.index]
+    if len(x) != len(y):
+        return None
+    beta = np.polyfit(x, y, 1)[0]
+    if beta >= 0:
+        return None
+    return np.log(2) / -beta
+
+
+def pick_divergence_trade(z_map: Dict[str, float], entry_z: float) -> Optional[Dict[str, float]]:
+    over = None
+    under = None
+    for ticker, z in z_map.items():
+        if z > entry_z and (over is None or z > over[1]):
+            over = (ticker, z)
+        if z < -entry_z and (under is None or z < under[1]):
+            under = (ticker, z)
+    if over is None or under is None:
+        return None
+    return {
+        "short": over[0],
+        "short_z": over[1],
+        "long": under[0],
+        "long_z": under[1],
+    }
+
+
+def calc_beta_neutral_shares(long_ticker: str, short_ticker: str, price_map: Dict[str, float],
+                             beta_map: Dict[str, float], base_notional: float = BETA_NOTIONAL):
+    long_price = price_map.get(long_ticker)
+    short_price = price_map.get(short_ticker)
+    if long_price is None or short_price is None:
+        return None
+    beta_long = abs(beta_map.get(long_ticker, 1.0))
+    beta_short = abs(beta_map.get(short_ticker, 1.0))
+    if beta_long < 1e-6 or beta_short < 1e-6:
+        return None
+    long_value = base_notional
+    short_value = base_notional * (beta_long / beta_short)
+    long_qty = int(max(1, min(long_value / long_price, MAX_TRADE_SIZE)))
+    short_qty = int(max(1, min(short_value / short_price, MAX_TRADE_SIZE)))
+    return long_qty, short_qty
+
+
+def enter_beta_neutral_trade(tick: int, long_tkr: str, short_tkr: str,
+                             price_map: Dict[str, float], beta_map: Dict[str, float]) -> Optional[BetaNeutralTrade]:
+    if not within_limits():
+        print("[LIMIT] Cannot enter beta-neutral trade; limits reached.")
+        return None
+    qtys = calc_beta_neutral_shares(long_tkr, short_tkr, price_map, beta_map)
+    if qtys is None:
+        print("[SIZING] Unable to size beta-neutral trade.")
+        return None
+    long_qty, short_qty = qtys
+    ok_long = place_mkt(long_tkr, "BUY", long_qty)
+    ok_short = place_mkt(short_tkr, "SELL", short_qty)
+    if ok_long and ok_short:
+        trade = BetaNeutralTrade(
+            long_ticker=long_tkr,
+            short_ticker=short_tkr,
+            long_qty=long_qty,
+            short_qty=short_qty,
+            long_entry=price_map[long_tkr],
+            short_entry=price_map[short_tkr],
+            entry_tick=tick,
+        )
+        long_value = trade.long_qty * trade.long_entry
+        short_value = trade.short_qty * trade.short_entry
+        print(f"[BETA ENTER] Long {long_tkr} ({long_qty}sh ${long_value:,.0f}) / "
+              f"Short {short_tkr} ({short_qty}sh ${short_value:,.0f})")
+        return trade
+    print("[ORDER FAIL] Unable to enter beta-neutral trade.")
+    if ok_long:
+        place_mkt(long_tkr, "SELL", long_qty)
+    if ok_short:
+        place_mkt(short_tkr, "BUY", short_qty)
+    return None
+
+
+def exit_beta_neutral_trade(trade: BetaNeutralTrade, tick: int, price_map: Dict[str, float], reason: str) -> float:
+    ok_long = place_mkt(trade.long_ticker, "SELL", trade.long_qty)
+    ok_short = place_mkt(trade.short_ticker, "BUY", trade.short_qty)
+    pnl = trade.unrealized_pnl(price_map)
+    trade.exit_tick = tick
+    trade.status = "CLOSED"
+    trade.reason = reason
+    trade.realized_pnl = pnl
+    if ok_long and ok_short:
+        print(f"[BETA EXIT] {reason} | {trade.long_ticker}/{trade.short_ticker} pnl={pnl:0.2f}")
+    else:
+        print("[ORDER FAIL] exit order issue encountered.")
+    return pnl
+
+
+# ========= DYNAMIC PLOT (single figure, 3 lines) =========
 # ========= DYNAMIC PLOT (single figure, 3 lines) =========
 def init_live_plot(hist_ticks=None, hist_ngn=None, hist_whel=None, hist_gear=None, beta_map=None):
     plt.ion()  # interactive mode on
@@ -312,13 +495,17 @@ def main():
     if df_hist is None:
         return
     beta_map = print_three_tables_and_betas(df_hist)   # dict with betas
-    pair_results = compute_cointegrated_pairs(df_hist)
-    print_cointegration_results(pair_results)
-    tradable_pairs = [p for p in pair_results if p["tradable"]]
-    if not tradable_pairs:
-        print("\nNo cointegrated pairs met the p-value threshold (< 0.05). Exiting.\n")
-        return
-    pair_states = {pair["name"]: None for pair in tradable_pairs}
+    pair_results = []
+    tradable_pairs = []
+    pair_states = {}
+    if ENABLE_COINTEGRATION:
+        pair_results = compute_cointegrated_pairs(df_hist)
+        print_cointegration_results(pair_results)
+        tradable_pairs = [p for p in pair_results if p["tradable"]]
+        if not tradable_pairs:
+            print("\nNo cointegrated pairs met the p-value threshold (< 0.05). Exiting.\n")
+            return
+        pair_states = {pair["name"]: None for pair in tradable_pairs}
 
     # Calculate historical divergences
     hist_ticks = df_hist["Tick"].values
@@ -329,6 +516,19 @@ def main():
     hist_ngn = (ptd_ngn_hist - beta_map["NGN"]  * ptd_idx_hist) * 100.0
     hist_whel = (ptd_whel_hist - beta_map["WHEL"] * ptd_idx_hist) * 100.0
     hist_gear = (ptd_gear_hist - beta_map["GEAR"] * ptd_idx_hist) * 100.0
+
+    divergence_hist_df = build_divergence_history(df_hist, beta_map)
+    div_vol = divergence_hist_df[TRADABLE_TICKERS].std().replace(0.0, np.nan)
+    div_vol_map = {t: float(div_vol.get(t, 1.0)) if not pd.isna(div_vol.get(t, np.nan)) else 1.0
+                   for t in TRADABLE_TICKERS}
+    avg_div_series = divergence_hist_df[TRADABLE_TICKERS].mean(axis=1)
+    est_half_life = estimate_half_life(avg_div_series)
+    max_hold_ticks = DEFAULT_MAX_HOLD if est_half_life is None else int(max(DEFAULT_MAX_HOLD, est_half_life * 3))
+    print(f"\nEstimated mean-reversion half-life: "
+          f"{'n/a' if est_half_life is None else f'{est_half_life:0.1f}'} ticks "
+          f"(timeout={max_hold_ticks} ticks)")
+    print("\nHistorical divergence snapshot (last 5 rows):\n")
+    print(divergence_hist_df.tail().to_string())
 
     # Prepare historical price arrays
     hist_prices = {
@@ -359,6 +559,11 @@ def main():
     # Init price plot
     fig_price, ax_price, line_ngn_p, line_whel_p, line_gear_p, line_idx_p = init_price_plot(
         hist_ticks, hist_prices, beta_map)
+
+    active_beta_trade: Optional[BetaNeutralTrade] = None
+    trade_log = []
+    signal_history = []
+    realized_pnl_total = 0.0
 
     # Run while case active
     tick, status = get_tick_status()
@@ -413,29 +618,110 @@ def main():
                 GEAR: mid_ger,
             }
 
-            for pair in tradable_pairs:
-                spread_val = live_spread(pair, price_map)
-                if spread_val is None:
-                    continue
-                z_score = (spread_val - pair["spread_mean"]) / pair["spread_std"]
-                state = pair_states[pair["name"]]
-                if state is None:
-                    if z_score > ENTRY_Z:
-                        if enter_pair_trade(pair, "SHORT_SPREAD"):
-                            pair_states[pair["name"]] = "SHORT_SPREAD"
-                            print(f"[PAIR ENTER] Short {pair['name']} | z={z_score:.2f}")
-                    elif z_score < -ENTRY_Z:
-                        if enter_pair_trade(pair, "LONG_SPREAD"):
-                            pair_states[pair["name"]] = "LONG_SPREAD"
-                            print(f"[PAIR ENTER] Long {pair['name']} | z={z_score:.2f}")
+            divergence_map = {
+                NGN: div_ngn,
+                WHEL: div_whe,
+                GEAR: div_ger,
+            }
+            z_map = {}
+            for ticker in TRADABLE_TICKERS:
+                denom = div_vol_map.get(ticker, 1.0)
+                if abs(denom) < 1e-6:
+                    denom = 1.0
+                z_map[ticker] = divergence_map[ticker] / denom
+
+            signal_comment = "FLAT"
+            unrealized = 0.0
+            portfolio_beta_now = 0.0
+
+            if active_beta_trade is None:
+                candidate = pick_divergence_trade(z_map, ENTRY_Z)
+                if candidate:
+                    trade = enter_beta_neutral_trade(
+                        tick,
+                        candidate["long"],
+                        candidate["short"],
+                        price_map,
+                        beta_map
+                    )
+                    if trade:
+                        active_beta_trade = trade
+                        signal_comment = f"ENTER {trade.long_ticker}/{trade.short_ticker}"
+            else:
+                z_long = z_map.get(active_beta_trade.long_ticker, 0.0)
+                z_short = z_map.get(active_beta_trade.short_ticker, 0.0)
+                exit_reason = None
+                if abs(z_long) < EXIT_Z and abs(z_short) < EXIT_Z:
+                    exit_reason = "MEAN_REVERSION"
+                elif max(abs(z_long), abs(z_short)) > STOP_Z:
+                    exit_reason = "STOP_Z"
+                elif (tick - active_beta_trade.entry_tick) >= max_hold_ticks:
+                    exit_reason = "TIMEOUT"
+
+                if exit_reason:
+                    realized_pnl_total += exit_beta_neutral_trade(active_beta_trade, tick, price_map, exit_reason)
+                    trade_log.append(active_beta_trade.to_log_dict())
+                    active_beta_trade = None
+                    signal_comment = f"EXIT {exit_reason}"
                 else:
-                    if abs(z_score) < EXIT_Z:
-                        flatten_pair_positions(pair)
-                        pair_states[pair["name"]] = None
-                        print(f"[PAIR EXIT]  {pair['name']} | z={z_score:.2f}")
+                    unrealized = active_beta_trade.unrealized_pnl(price_map)
+                    portfolio_beta_now = active_beta_trade.exposure_beta(price_map, beta_map)
+                    signal_comment = f"HOLD {active_beta_trade.long_ticker}/{active_beta_trade.short_ticker}"
+
+            signal_history.append({
+                "tick": tick,
+                "div_NGN": div_ngn,
+                "div_WHEL": div_whe,
+                "div_GEAR": div_ger,
+                "z_NGN": z_map.get(NGN),
+                "z_WHEL": z_map.get(WHEL),
+                "z_GEAR": z_map.get(GEAR),
+                "signal": signal_comment,
+                "portfolio_beta": portfolio_beta_now,
+                "unrealized_pnl": unrealized,
+                "realized_pnl": realized_pnl_total,
+            })
+
+            if ENABLE_COINTEGRATION:
+                for pair in tradable_pairs:
+                    spread_val = live_spread(pair, price_map)
+                    if spread_val is None:
+                        continue
+                    z_score = (spread_val - pair["spread_mean"]) / pair["spread_std"]
+                    state = pair_states[pair["name"]]
+                    if state is None:
+                        if z_score > ENTRY_Z:
+                            if enter_pair_trade(pair, "SHORT_SPREAD"):
+                                pair_states[pair["name"]] = "SHORT_SPREAD"
+                                print(f"[PAIR ENTER] Short {pair['name']} | z={z_score:.2f}")
+                        elif z_score < -ENTRY_Z:
+                            if enter_pair_trade(pair, "LONG_SPREAD"):
+                                pair_states[pair["name"]] = "LONG_SPREAD"
+                                print(f"[PAIR ENTER] Long {pair['name']} | z={z_score:.2f}")
+                    else:
+                        if abs(z_score) < EXIT_Z:
+                            flatten_pair_positions(pair)
+                            pair_states[pair["name"]] = None
+                            print(f"[PAIR EXIT]  {pair['name']} | z={z_score:.2f}")
 
         sleep(SLEEP_SEC)
         tick, status = get_tick_status()
+
+    if signal_history:
+        signal_df = pd.DataFrame(signal_history)
+        print("\nSignal summary (last 10 observations):\n")
+        print(signal_df.tail(10).to_string(index=False))
+    else:
+        print("\nNo signal observations captured.\n")
+
+    if trade_log:
+        trade_df = pd.DataFrame(trade_log)
+        total_pnl = trade_df["realized_pnl"].sum()
+        print("\nBeta-neutral trade log:\n")
+        print(trade_df.to_string(index=False))
+        print(f"\nTotal realized P&L: {total_pnl:0.2f}")
+    else:
+        print("\nNo beta-neutral trades executed.\n")
 
     # Keep the final chart on screen after loop ends
     plt.ioff()
