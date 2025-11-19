@@ -10,6 +10,7 @@ from time import sleep
 import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
+from itertools import combinations
 
 '''
 If you have any question about REST APIs and outputs of code please read:
@@ -32,6 +33,7 @@ from time import sleep
 import matplotlib.pyplot as plt
 import os
 from dotenv import load_dotenv
+from statsmodels.tsa.stattools import adfuller
 load_dotenv()
 
 # ========= CONFIG =========
@@ -41,14 +43,16 @@ print("API KEY:", API_KEY)
 HDRS = {"X-API-key": API_KEY}
 
 NGN, WHEL, GEAR, RSM1000 = "NGN", "WHEL", "GEAR", "RSM1000"
+TRADABLE_TICKERS = (NGN, WHEL, GEAR)
+ALL_TICKERS = TRADABLE_TICKERS + (RSM1000,)
 
 FEE_MKT = 0.01          # $/share (market)
 ORDER_SIZE      = 5000
 MAX_TRADE_SIZE  = 10_000
 GROSS_LIMIT_SH  = 500_000
 NET_LIMIT_SH    = 100_000
-ENTRY_BAND_PCT  = 0.10   # enter if |div| > 0.50%
-EXIT_BAND_PCT   = 0.1   # flatten if |div| < 0.20%
+ENTRY_Z         = 2.0
+EXIT_Z          = 0.5
 SLEEP_SEC       = 0.25
 PRINT_HEARTBEAT = True
 
@@ -78,7 +82,7 @@ def mid_price(ticker):
 def positions_map():
     r = s.get(f"{API}/securities"); r.raise_for_status()
     out = {p["ticker"]: int(p.get("position", 0)) for p in r.json()}
-    for k in (NGN, WHEL, GEAR, RSM1000):
+    for k in ALL_TICKERS:
         out.setdefault(k, 0)
     return out
 
@@ -93,8 +97,8 @@ def place_mkt(ticker, action, qty):
 
 def within_limits():
     pos = positions_map()
-    gross = abs(pos[NGN]) + abs(pos[WHEL]) + abs(pos[GEAR])
-    net   = pos[NGN] + pos[WHEL] + pos[GEAR]
+    gross = sum(abs(pos[t]) for t in TRADABLE_TICKERS)
+    net   = sum(pos[t] for t in TRADABLE_TICKERS)
     return ((gross) < GROSS_LIMIT_SH) and (abs(net) < NET_LIMIT_SH)
 
 # ========= HISTORICAL (tables + betas) =========
@@ -146,6 +150,89 @@ def print_three_tables_and_betas(df_hist):
     print("\nHistorical Volatility and Beta:\n")
     print(vol_beta_df.to_string())
     return beta_map
+
+# ========= COINTEGRATION HELPERS =========
+def compute_cointegrated_pairs(df_hist, tickers=TRADABLE_TICKERS, pvalue_limit=0.05):
+    pairs = []
+    for y_tkr, x_tkr in combinations(tickers, 2):
+        series_y = df_hist[y_tkr].astype(float).values
+        series_x = df_hist[x_tkr].astype(float).values
+        if len(series_y) < 30:
+            continue
+        X = np.column_stack([series_x, np.ones(len(series_x))])
+        try:
+            beta, alpha = np.linalg.lstsq(X, series_y, rcond=None)[0]
+        except np.linalg.LinAlgError:
+            continue
+        spread = series_y - (beta * series_x + alpha)
+        mask = np.isfinite(spread)
+        spread = spread[mask]
+        if len(spread) < 10:
+            continue
+        try:
+            pvalue = adfuller(spread)[1]
+        except ValueError:
+            continue
+        spread_std = float(np.std(spread, ddof=1))
+        if spread_std < 1e-6:
+            continue
+        pairs.append({
+            "name": f"{y_tkr}/{x_tkr}",
+            "y": y_tkr,
+            "x": x_tkr,
+            "alpha": float(alpha),
+            "beta": float(beta),
+            "spread_mean": float(np.mean(spread)),
+            "spread_std": spread_std,
+            "pvalue": float(pvalue),
+            "tradable": pvalue < pvalue_limit
+        })
+    return sorted(pairs, key=lambda p: p["pvalue"])
+
+def print_cointegration_results(pairs, pvalue_limit=0.05):
+    if not pairs:
+        print("\nNo valid pairs to evaluate.\n")
+        return
+    print("\nCointegration (ADF) Results:\n")
+    header = " Pair        |  p-value | beta    | spread σ | status"
+    print(header)
+    print("-" * len(header))
+    for pair in pairs:
+        status = "TRADE" if pair["pvalue"] < pvalue_limit else "SKIP"
+        print(f"{pair['name']:>12} | {pair['pvalue']:.4f} | {pair['beta']:+.4f} | {pair['spread_std']:.4f} | {status}")
+
+def live_spread(pair_cfg, price_map):
+    y = price_map.get(pair_cfg["y"])
+    x = price_map.get(pair_cfg["x"])
+    if y is None or x is None:
+        return None
+    return y - (pair_cfg["beta"] * x + pair_cfg["alpha"])
+
+def _x_action(direction, beta):
+    if direction == "SHORT_SPREAD":
+        return "BUY" if beta >= 0 else "SELL"
+    return "SELL" if beta >= 0 else "BUY"
+
+def enter_pair_trade(pair_cfg, direction):
+    if not within_limits():
+        return False
+    qty_y = ORDER_SIZE
+    qty_x = max(1, int(abs(pair_cfg["beta"]) * ORDER_SIZE))
+    action_y = "SELL" if direction == "SHORT_SPREAD" else "BUY"
+    action_x = _x_action(direction, pair_cfg["beta"])
+    ok_y = place_mkt(pair_cfg["y"], action_y, qty_y)
+    ok_x = place_mkt(pair_cfg["x"], action_x, qty_x)
+    return ok_y and ok_x
+
+def flatten_pair_positions(pair_cfg):
+    pos = positions_map()
+    for tkr in (pair_cfg["y"], pair_cfg["x"]):
+        qty = pos.get(tkr, 0)
+        if qty > 0:
+            place_mkt(tkr, "SELL", qty)
+        elif qty < 0:
+            place_mkt(tkr, "BUY", abs(qty))
+    return True
 
 # ========= DYNAMIC PLOT (single figure, 3 lines) =========
 def init_live_plot(hist_ticks=None, hist_ngn=None, hist_whel=None, hist_gear=None, beta_map=None):
@@ -225,6 +312,13 @@ def main():
     if df_hist is None:
         return
     beta_map = print_three_tables_and_betas(df_hist)   # dict with betas
+    pair_results = compute_cointegrated_pairs(df_hist)
+    print_cointegration_results(pair_results)
+    tradable_pairs = [p for p in pair_results if p["tradable"]]
+    if not tradable_pairs:
+        print("\nNo cointegrated pairs met the p-value threshold (< 0.05). Exiting.\n")
+        return
+    pair_states = {pair["name"]: None for pair in tradable_pairs}
 
     # Calculate historical divergences
     hist_ticks = df_hist["Tick"].values
@@ -312,24 +406,33 @@ def main():
             update_price_plot(ax_price, line_ngn_p, line_whel_p, line_gear_p, line_idx_p,
                              ticks_p, ngn_p, whel_p, gear_p, idx_p)
 
-            # trade per symbol (simple mean-reversion)
-            # ======== Strat 1 ========
-            def trade_on_div(tkr, div_pct):
-                if div_pct > ENTRY_BAND_PCT and within_limits():
-                    place_mkt(tkr, "SELL", ORDER_SIZE)
-                elif div_pct < -ENTRY_BAND_PCT and within_limits():
-                    place_mkt(tkr, "BUY", ORDER_SIZE)
-                # ======== Strat 1.1 ========
-                elif abs(div_pct) < EXIT_BAND_PCT:
-                    pos = positions_map().get(tkr, 0)
-                    if pos > 0:
-                        place_mkt(tkr, "SELL", abs(pos))
-                    elif pos < 0:
-                        place_mkt(tkr, "BUY", abs(pos))
+            price_map = {
+                RSM1000: mid_idx,
+                NGN: mid_ngn,
+                WHEL: mid_whe,
+                GEAR: mid_ger,
+            }
 
-            trade_on_div(NGN,  div_ngn)
-            trade_on_div(WHEL, div_whe)
-            trade_on_div(GEAR, div_ger)
+            for pair in tradable_pairs:
+                spread_val = live_spread(pair, price_map)
+                if spread_val is None:
+                    continue
+                z_score = (spread_val - pair["spread_mean"]) / pair["spread_std"]
+                state = pair_states[pair["name"]]
+                if state is None:
+                    if z_score > ENTRY_Z:
+                        if enter_pair_trade(pair, "SHORT_SPREAD"):
+                            pair_states[pair["name"]] = "SHORT_SPREAD"
+                            print(f"[PAIR ENTER] Short {pair['name']} | z={z_score:.2f}")
+                    elif z_score < -ENTRY_Z:
+                        if enter_pair_trade(pair, "LONG_SPREAD"):
+                            pair_states[pair["name"]] = "LONG_SPREAD"
+                            print(f"[PAIR ENTER] Long {pair['name']} | z={z_score:.2f}")
+                else:
+                    if abs(z_score) < EXIT_Z:
+                        flatten_pair_positions(pair)
+                        pair_states[pair["name"]] = None
+                        print(f"[PAIR EXIT]  {pair['name']} | z={z_score:.2f}")
 
         sleep(SLEEP_SEC)
         tick, status = get_tick_status()
