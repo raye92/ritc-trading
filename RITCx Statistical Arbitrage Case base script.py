@@ -30,7 +30,6 @@ load_dotenv()
 # ========= CONFIG =========
 API = "http://localhost:9999/v1"
 API_KEY = os.getenv("API_KEY", "Rotman")
-print("API KEY:", API_KEY)
 HDRS = {"X-API-key": API_KEY}
 
 NGN, WHEL, GEAR, RSM1000 = "NGN", "WHEL", "GEAR", "RSM1000"
@@ -40,8 +39,8 @@ ORDER_SIZE      = 5000
 MAX_TRADE_SIZE  = 10_000
 GROSS_LIMIT_SH  = 500_000
 NET_LIMIT_SH    = 100_000
-ENTRY_BAND_PCT  = 0.10   # enter if |div| > 0.50%
-EXIT_BAND_PCT   = 0.1   # flatten if |div| < 0.20%
+ENTRY_BAND_PCT = 0.6   # enter if |div| > 0.6%  (div > 0.6)
+EXIT_BAND_PCT  = 0.25  # flatten once |div| < 0.25%
 SLEEP_SEC       = 0.25
 PRINT_HEARTBEAT = True
 
@@ -114,6 +113,37 @@ def load_historical():
     for c in ["RSM1000", "NGN", "WHEL", "GEAR"]:
         df_hist[c] = df_hist[c].astype(float)
     return df_hist
+
+def fit_alpha_beta(ptd_idx, ptd_stock):
+    beta, alpha = np.polyfit(ptd_idx, ptd_stock, 1)
+    return float(alpha), float(beta)
+
+
+def compute_hist_divergence(ptd_idx, ptd_stock, alpha, beta):
+    fair = alpha + beta * ptd_idx
+    hist_div = (ptd_stock - fair) * 100.0
+    return hist_div
+
+def trade_on_div(tkr, div_pct):
+    """
+    Trade on raw divergence in percentage points, using ENTRY_BAND_PCT and EXIT_BAND_PCT.
+
+    - If div_pct >  ENTRY_BAND_PCT  -> stock rich vs fair -> SELL
+    - If div_pct < -ENTRY_BAND_PCT  -> stock cheap vs fair -> BUY
+    - If |div_pct| < EXIT_BAND_PCT  -> flatten position
+    """
+    if div_pct > ENTRY_BAND_PCT and within_limits():
+        place_mkt(tkr, "SELL", ORDER_SIZE)
+    elif div_pct < -ENTRY_BAND_PCT and within_limits():
+        place_mkt(tkr, "BUY", ORDER_SIZE)
+    elif abs(div_pct) < EXIT_BAND_PCT:
+        pos = positions_map().get(tkr, 0)
+        if pos > 0:
+            place_mkt(tkr, "SELL", abs(pos))
+        elif pos < 0:
+            place_mkt(tkr, "BUY", abs(pos))
+
+
 
 def print_three_tables_and_betas(df_hist):
     # 1) Historical price table
@@ -239,23 +269,39 @@ def update_price_plot(ax, line_ngn, line_whel, line_gear, line_idx, ticks, ngn, 
 
 # ========= MAIN =========
 def main():
-    # Load historical once to get betas
+    # Load historical once
     df_hist = load_historical()
     if df_hist is None:
         return
-    beta_map = print_three_tables_and_betas(df_hist)   # dict with betas
 
-    # Calculate historical divergences
-    hist_ticks = df_hist["Tick"].values
-    ptd_idx_hist = (df_hist["RSM1000"] / df_hist["RSM1000"].iloc[0]) - 1.0
-    ptd_ngn_hist = (df_hist["NGN"] / df_hist["NGN"].iloc[0]) - 1.0
-    ptd_whel_hist = (df_hist["WHEL"] / df_hist["WHEL"].iloc[0]) - 1.0
-    ptd_gear_hist = (df_hist["GEAR"] / df_hist["GEAR"].iloc[0]) - 1.0
-    hist_ngn = (ptd_ngn_hist - beta_map["NGN"]  * ptd_idx_hist) * 100.0
-    hist_whel = (ptd_whel_hist - beta_map["WHEL"] * ptd_idx_hist) * 100.0
-    hist_gear = (ptd_gear_hist - beta_map["GEAR"] * ptd_idx_hist) * 100.0
+    # Print the original beta diagnostics (this uses cov-based betas; fine for info/legend)
+    beta_map = print_three_tables_and_betas(df_hist)
 
-    # Prepare historical price arrays
+    # === 1) Historical PTD series ===
+    hist_ticks    = df_hist["Tick"].values
+    ptd_idx_hist  = (df_hist["RSM1000"] / df_hist["RSM1000"].iloc[0]) - 1.0
+    ptd_ngn_hist  = (df_hist["NGN"]      / df_hist["NGN"].iloc[0])      - 1.0
+    ptd_whel_hist = (df_hist["WHEL"]     / df_hist["WHEL"].iloc[0])     - 1.0
+    ptd_gear_hist = (df_hist["GEAR"]     / df_hist["GEAR"].iloc[0])     - 1.0
+
+    # === 2) Fit alpha/beta ONCE from historical data ===
+    # These are fixed for the whole run (competition-safe)
+    alpha_beta = {
+        "NGN":  fit_alpha_beta(ptd_idx_hist, ptd_ngn_hist),
+        "WHEL": fit_alpha_beta(ptd_idx_hist, ptd_whel_hist),
+        "GEAR": fit_alpha_beta(ptd_idx_hist, ptd_gear_hist),
+    }
+
+    # === 3) Historical divergence series (for plotting) ===
+    a_ngn,  b_ngn  = alpha_beta["NGN"]
+    a_whel, b_whel = alpha_beta["WHEL"]
+    a_ger,  b_ger  = alpha_beta["GEAR"]
+
+    hist_ngn  = compute_hist_divergence(ptd_idx_hist, ptd_ngn_hist,  a_ngn,  b_ngn)
+    hist_whel = compute_hist_divergence(ptd_idx_hist, ptd_whel_hist, a_whel, b_whel)
+    hist_gear = compute_hist_divergence(ptd_idx_hist, ptd_gear_hist, a_ger,  b_ger)
+
+    # === 4) Historical price arrays for the price plot (unchanged) ===
     hist_prices = {
         'NGN': df_hist['NGN'].values,
         'WHEL': df_hist['WHEL'].values,
@@ -269,7 +315,7 @@ def main():
     base_whe = None
     base_ger = None
 
-    # Data buffers for live plot
+    # Data buffers for live divergence plot
     ticks = []
     div_ngn_list, div_whe_list, div_ger_list = [], [], []
 
@@ -277,13 +323,15 @@ def main():
     ticks_p = []
     ngn_p, whel_p, gear_p, idx_p = [], [], [], []
 
-    # Init dynamic plot with historical data and beta values in legend
+    # Init dynamic divergence plot with historical data
     fig, ax, line_ngn, line_whel, line_gear = init_live_plot(
-        hist_ticks, hist_ngn, hist_whel, hist_gear, beta_map)
+        hist_ticks, hist_ngn, hist_whel, hist_gear, beta_map
+    )
 
     # Init price plot
     fig_price, ax_price, line_ngn_p, line_whel_p, line_gear_p, line_idx_p = init_price_plot(
-        hist_ticks, hist_prices, beta_map)
+        hist_ticks, hist_prices, beta_map
+    )
 
     # Run while case active
     tick, status = get_tick_status()
@@ -302,59 +350,48 @@ def main():
         if base_ger is None and mid_ger is not None: base_ger = mid_ger
 
         # compute PTDs only if all bases/mids exist
-        if None not in (base_idx, base_ngn, base_whe, base_ger,
-                        mid_idx,  mid_ngn,  mid_whe,  mid_ger):
-            
-            # Add current tick to historical data and recalculate betas
-            df_hist = add_tick_to_history(df_hist, tick, mid_idx, mid_ngn, mid_whe, mid_ger)
-            updated_betas = calculate_betas(df_hist)
-            if updated_betas is not None:
-                beta_map = updated_betas
+        if None not in (
+            base_idx, base_ngn, base_whe, base_ger,
+            mid_idx,  mid_ngn,  mid_whe,  mid_ger
+        ):
 
+            # === 5) Live PTD series ===
             ptd_idx = (mid_idx / base_idx) - 1.0
             ptd_ngn = (mid_ngn / base_ngn) - 1.0
-            ptd_whe = (mid_whe / base_whe) - 1.0
+            ptd_whel = (mid_whe / base_whe) - 1.0
             ptd_ger = (mid_ger / base_ger) - 1.0
 
-            # EXACT divergence formula (percentage points)
-            div_ngn = (ptd_ngn - beta_map["NGN"]  * ptd_idx) * 100.0
-            div_whe = (ptd_whe - beta_map["WHEL"] * ptd_idx) * 100.0
-            div_ger = (ptd_ger - beta_map["GEAR"] * ptd_idx) * 100.0
+            # === 6) Live divergences using alpha+beta fair value ===
+            div_ngn = (ptd_ngn  - (a_ngn  + b_ngn  * ptd_idx)) * 100.0
+            div_whel = (ptd_whel - (a_whel + b_whel * ptd_idx)) * 100.0
+            div_ger = (ptd_ger  - (a_ger  + b_ger  * ptd_idx)) * 100.0
 
-            # store + update plot
+            # === 7) Update divergence plot ===
             ticks.append(tick)
             div_ngn_list.append(div_ngn)
-            div_whe_list.append(div_whe)
+            div_whe_list.append(div_whel)
             div_ger_list.append(div_ger)
-            update_live_plot(ax, line_ngn, line_whel, line_gear,
-                             ticks, div_ngn_list, div_whe_list, div_ger_list)
 
-            # store + update price plot
+            update_live_plot(
+                ax, line_ngn, line_whel, line_gear,
+                ticks, div_ngn_list, div_whe_list, div_ger_list
+            )
+
+            # === 8) Update price plot (unchanged) ===
             ticks_p.append(tick)
             ngn_p.append(mid_ngn)
             whel_p.append(mid_whe)
             gear_p.append(mid_ger)
             idx_p.append(mid_idx)
-            update_price_plot(ax_price, line_ngn_p, line_whel_p, line_gear_p, line_idx_p,
-                             ticks_p, ngn_p, whel_p, gear_p, idx_p)
 
-            # trade per symbol (simple mean-reversion)
-            # ======== Strat 1 ========
-            def trade_on_div(tkr, div_pct):
-                if div_pct > ENTRY_BAND_PCT and within_limits():
-                    place_mkt(tkr, "SELL", ORDER_SIZE)
-                elif div_pct < -ENTRY_BAND_PCT and within_limits():
-                    place_mkt(tkr, "BUY", ORDER_SIZE)
-                # ======== Strat 1.1 ========
-                elif abs(div_pct) < EXIT_BAND_PCT:
-                    pos = positions_map().get(tkr, 0)
-                    if pos > 0:
-                        place_mkt(tkr, "SELL", abs(pos))
-                    elif pos < 0:
-                        place_mkt(tkr, "BUY", abs(pos))
+            update_price_plot(
+                ax_price, line_ngn_p, line_whel_p, line_gear_p, line_idx_p,
+                ticks_p, ngn_p, whel_p, gear_p, idx_p
+            )
 
+            # === 9) Trade on raw divergence (no z-scores) ===
             trade_on_div(NGN,  div_ngn)
-            trade_on_div(WHEL, div_whe)
+            trade_on_div(WHEL, div_whel)
             trade_on_div(GEAR, div_ger)
 
         sleep(SLEEP_SEC)
