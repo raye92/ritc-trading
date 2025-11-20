@@ -44,10 +44,10 @@ EXIT_BAND_PCT  = 0.25  # flatten once |div| < 0.25%
 SLEEP_SEC       = 0.25
 PRINT_HEARTBEAT = True
 
-MIN_SHARES = 5000
-MAX_SHARES = 10000
+
 MIN_SPREAD_ZSCORE = 1   #  (start trading here)
 MAX_SPREAD_ZSCORE = 2     # (full size here)
+EXIT_SPREAD_ZSCORE = 0.5  # (exit trades below this)
 
 # ========= SESSION =========
 s = requests.Session()
@@ -189,8 +189,8 @@ def compute_spread_stats(df_hist: pd.DataFrame, beta_map):
 
     # Historical spreads (first - second)
     spread_ngn_whe = div_ngn - div_whe
-    spread_ngn_ger = div_ngn - div_ger
-    spread_whe_ger = div_whe - div_ger
+    spread_ger_ngn = div_ger - div_ngn
+    spread_ger_whe = div_ger - div_whe
 
     def safe_sigma(series):
         val = float(series.std(ddof=1))
@@ -201,13 +201,13 @@ def compute_spread_stats(df_hist: pd.DataFrame, beta_map):
             "mu": float(spread_ngn_whe.mean()),
             "sigma": safe_sigma(spread_ngn_whe),
         },
-        (NGN, GEAR): {
-            "mu": float(spread_ngn_ger.mean()),
-            "sigma": safe_sigma(spread_ngn_ger),
+        (GEAR, NGN): {
+            "mu": float(spread_ger_ngn.mean()),
+            "sigma": safe_sigma(spread_ger_ngn),
         },
-        (WHEL, GEAR): {
-            "mu": float(spread_whe_ger.mean()),
-            "sigma": safe_sigma(spread_whe_ger),
+        (GEAR, WHEL): {
+            "mu": float(spread_ger_whe.mean()),
+            "sigma": safe_sigma(spread_ger_whe),
         },
     }
     return spread_stats
@@ -281,6 +281,9 @@ def main():
     tick, status = get_tick_status()
 
     minDiv, maxDiv = 0, 0
+
+    openPositions = {(NGN, WHEL): {NGN: 0, WHEL: 0}, (GEAR, WHEL): {WHEL: 0, GEAR: 0}, (GEAR, NGN): {NGN: 0, GEAR: 0}}
+
     while status == "ACTIVE":
         # current mids
         mid_idx = mid_price(RSM1000)
@@ -326,31 +329,76 @@ def main():
             # determine the secuirity with the lowest and highest diveregence
             sortedTickDivergences = sorted([(div_ngn, NGN), (div_whe, WHEL), (div_ger, GEAR)])
             # fees = 0.01⋅2(L+S)=0.02(L+S)
-            betaRatio = abs(beta_map[sortedTickDivergences[-1][1]] / beta_map[sortedTickDivergences[0][1]])
-
-            # per-security z-scores (based on divergence sigma)
-            z_map = {
-                NGN:  float(div_ngn / sigma_div[NGN]),
-                WHEL: float(div_whe / sigma_div[WHEL]),
-                GEAR: float(div_ger / sigma_div[GEAR]),
-            }
 
             # spread z-scores (based on historical spread stats)
             spread_z_map = compute_spread_zscores(divs, spread_stats)
             # e.g. spread_z_map[(NGN, WHEL)], spread_z_map[(NGN, GEAR)], spread_z_map[(WHEL, GEAR)]
 
             # example stock-based scaling (you can replace with spread_z_map logic if you want)
-            currSpreadZScore = spread_z_map[(sortedTickDivergences[0][1], sortedTickDivergences[-1][1])]
+            currSpreadZScore = spread_z_map[tuple(sorted([sortedTickDivergences[0][1], sortedTickDivergences[-1][1]]))] 
             intensity = max(0.0, min(1.0, (currSpreadZScore - MIN_SPREAD_ZSCORE) / (MAX_SPREAD_ZSCORE - MIN_SPREAD_ZSCORE)))
-            largerBuy = int(MIN_SHARES + intensity * (MAX_SHARES - MIN_SHARES))
-            largerBuy = max(MIN_SHARES, min(largerBuy, MAX_SHARES, MAX_TRADE_SIZE))
+            largerBuySz = int(ORDER_SIZE + intensity * (MAX_TRADE_SIZE - ORDER_SIZE))
+            largerBuySz = max(ORDER_SIZE, min(largerBuySz, MAX_TRADE_SIZE))
 
-            smallerBuy = largerBuy 
-            largerCost = FEE_MKT * 2 * largerBuy * (1 + betaRatio)
+            if abs(divs[sortedTickDivergences[-1][1]]) > abs(divs[sortedTickDivergences[0][1]]):
+                largerBuyTkr = sortedTickDivergences[-1][1]
+                smallerBuyTkr = sortedTickDivergences[0][1]
+            else:
+                largerBuyTkr = sortedTickDivergences[0][1]
+                smallerBuyTkr = sortedTickDivergences[-1][1]
 
-            minDiv, maxDiv = min(minDiv, sortedTickDivergences[0][0]), max(maxDiv, sortedTickDivergences[-1][0])
-            print(minDiv, maxDiv)
+            largerBuyDollars = largerBuySz * mid_price(largerBuyTkr)
+            betaRatio = abs(beta_map[largerBuyTkr] / beta_map[smallerBuyTkr])
+
+            smallerBuyDollars = largerBuyDollars / betaRatio
+            smallerBuysz = int(smallerBuyDollars / mid_price(smallerBuyTkr))
+
+            if smallerBuysz > MAX_TRADE_SIZE:
+                reductionFactor = smallerBuysz / MAX_TRADE_SIZE
+                smallerBuysz = MAX_TRADE_SIZE
+                largerBuySz = int(largerBuySz / reductionFactor)
+
+            # maybe add a second guard for buying depending on costs of making trade rather than purely likelyhood
+            # of spread
+
+            # Place trades
+            if within_limits():
+                if divs[largerBuyTkr] > divs[smallerBuyTkr]:
+                    place_mkt(largerBuyTkr, "BUY", largerBuySz)
+                    place_mkt(smallerBuyTkr, "SELL", smallerBuysz)
+                    openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][largerBuyTkr] += largerBuySz
+                    openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][smallerBuyTkr] -= smallerBuysz
+                else:
+                    place_mkt(largerBuyTkr, "SELL", largerBuySz)
+                    place_mkt(smallerBuyTkr, "BUY", smallerBuysz)
+                    openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][largerBuyTkr] -= largerBuySz
+                    openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][smallerBuyTkr] += smallerBuysz
+
+            # close positions on spreads close to 0:   
+            for (a, b), z_score in spread_z_map.items():
+                if abs(z_score) < EXIT_SPREAD_ZSCORE:
+                    spreadPositions = openPositions[(a, b)]
+                    if spreadPositions[a] > 0:
+                        place_mkt(a, "SELL", abs(spreadPositions[a]))
+                    elif spreadPositions[a] < 0:
+                        place_mkt(a, "BUY", abs(spreadPositions[a]))
+                    if spreadPositions[b] > 0:
+                        place_mkt(b, "SELL", abs(spreadPositions[b]))
+                    elif spreadPositions[b] < 0:
+                        place_mkt(b, "BUY", abs(spreadPositions[b]))
+                    openPositions[(a, b)] = {a: 0, b: 0}
             
+            print(openPositions)
+                    
+            
+            """
+            # trade per symbol (simple mean-reversion)
+            def trade_on_div(tkr, div_pct):
+                if div_pct > ENTRY_BAND_PCT and within_limits():
+                    place_mkt(tkr, "SELL", ORDER_SIZE)
+                elif div_pct < -ENTRY_BAND_PCT and within_limits():
+                    place_mkt(tkr, "BUY", ORDER_SIZE)"""
+
         sleep(SLEEP_SEC)
         tick, status = get_tick_status()
 
