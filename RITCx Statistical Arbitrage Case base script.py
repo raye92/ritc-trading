@@ -30,7 +30,6 @@ load_dotenv()
 # ========= CONFIG =========
 API = "http://localhost:9999/v1"
 API_KEY = os.getenv("API_KEY", "Rotman")
-print("API KEY:", API_KEY)
 HDRS = {"X-API-key": API_KEY}
 
 NGN, WHEL, GEAR, RSM1000 = "NGN", "WHEL", "GEAR", "RSM1000"
@@ -40,10 +39,15 @@ ORDER_SIZE      = 5000
 MAX_TRADE_SIZE  = 10_000
 GROSS_LIMIT_SH  = 500_000
 NET_LIMIT_SH    = 100_000
-ENTRY_BAND_PCT  = 0.10   # enter if |div| > 0.50%
-EXIT_BAND_PCT   = 0.1   # flatten if |div| < 0.20%
+ENTRY_BAND_PCT = 0.6   # enter if |div| > 0.6%  (div > 0.6)
+EXIT_BAND_PCT  = 0.25  # flatten once |div| < 0.25%
 SLEEP_SEC       = 0.25
 PRINT_HEARTBEAT = True
+
+MIN_SHARES = 5000
+MAX_SHARES = 10000
+MIN_SPREAD_ZSCORE = 1   #  (start trading here)
+MAX_SPREAD_ZSCORE = 2     # (full size here)
 
 # ========= SESSION =========
 s = requests.Session()
@@ -115,74 +119,123 @@ def load_historical():
         df_hist[c] = df_hist[c].astype(float)
     return df_hist
 
-def print_three_tables_and_betas(df_hist):
-    # 1) Historical price table
-    pd.set_option("display.float_format", lambda x: f"{x:0.6f}")
-    print("\nHistorical Price Data:\n")
-    print(df_hist.to_string(index=False))
+def compute_betas_and_div_sigma(df_hist: pd.DataFrame):
+    # df_hist has columns: ["Tick", "RSM1000", "NGN", "WHEL", "GEAR"]
+    returns = df_hist[[RSM1000, NGN, WHEL, GEAR]].pct_change().dropna()
+    idx_var = returns[RSM1000].var()
 
-    # 2) Correlation on tick returns
-    returns = df_hist[["RSM1000", "NGN", "WHEL", "GEAR"]].pct_change().dropna()
-    corr = returns.corr()
-    print("\nHistorical Correlation:\n")
-    print(corr.to_string())
+    beta_map = {
+        t: float(np.cov(returns[t], returns[RSM1000])[0, 1] / idx_var)
+        for t in [NGN, WHEL, GEAR]
+    }
 
-    # 3) Volatility & beta (vs RSM1000)
-    tick_vol = returns.std()
-    idx_var  = returns["RSM1000"].var()
-    beta_map = {t: float(np.cov(returns[t], returns["RSM1000"])[0,1] / idx_var)
-                for t in ["RSM1000","NGN","WHEL","GEAR"]}
-    vol_beta_df = pd.DataFrame({
-        "Tick Volatility": tick_vol,
-        "Beta vs RSM1000": [beta_map[t] for t in tick_vol.index]
-    })
-    print("\nHistorical Volatility and Beta:\n")
-    print(vol_beta_df.to_string())
-    return beta_map
+    base_idx = df_hist[RSM1000].iloc[0]
+    base_ngn = df_hist[NGN].iloc[0]
+    base_whe = df_hist[WHEL].iloc[0]
+    base_ger = df_hist[GEAR].iloc[0]
 
-def calculate_betas(df_hist):
-    #Calculate beta map from dataframe
-    if len(df_hist) < 2:
-        return None
-    returns = df_hist[["RSM1000", "NGN", "WHEL", "GEAR"]].pct_change().dropna()
-    if len(returns) < 1:
-        return None
-    idx_var = returns["RSM1000"].var()
-    if idx_var == 0:
-        return None
-    beta_map = {t: float(np.cov(returns[t], returns["RSM1000"])[0,1] / idx_var)
-                for t in ["RSM1000","NGN","WHEL","GEAR"]}
-    return beta_map
+    ptd_idx = df_hist[RSM1000] / base_idx - 1.0
+    ptd_ngn = df_hist[NGN]      / base_ngn - 1.0
+    ptd_whe = df_hist[WHEL]     / base_whe - 1.0
+    ptd_ger = df_hist[GEAR]     / base_ger - 1.0
 
-def add_tick_to_history(df_hist, tick, mid_idx, mid_ngn, mid_whe, mid_ger):
-    """Add new tick data to historical dataframe"""
-    new_row = pd.DataFrame({
-        "Tick": [tick],
-        "RSM1000": [mid_idx],
-        "NGN": [mid_ngn],
-        "WHEL": [mid_whe],
-        "GEAR": [mid_ger]
-    })
-    df_hist = pd.concat([df_hist, new_row], ignore_index=True)
-    return df_hist
+    div_ngn = (ptd_ngn - beta_map[NGN]  * ptd_idx) * 100.0
+    div_whe = (ptd_whe - beta_map[WHEL] * ptd_idx) * 100.0
+    div_ger = (ptd_ger - beta_map[GEAR] * ptd_idx) * 100.0
+
+    sigma_div = {
+        NGN: float(div_ngn.std(ddof=1)),
+        WHEL: float(div_whe.std(ddof=1)),
+        GEAR: float(div_ger.std(ddof=1)),
+    }
+
+    for k, v in sigma_div.items():
+        if v < 1e-8:
+            sigma_div[k] = 1.0
+
+    bases = {
+        RSM1000: base_idx,
+        NGN: base_ngn,
+        WHEL: base_whe,
+        GEAR: base_ger,
+    }
+
+    return beta_map, sigma_div, bases
+
+# ========= NEW: SPREAD STATS & SPREAD Z-SCORES =========
+def compute_spread_stats(df_hist: pd.DataFrame, beta_map):
+    """
+    From historical data + betas, compute historical divergences and
+    then the mean and std of divergence spreads for each pair:
+        (NGN, WHEL), (NGN, GEAR), (WHEL, GEAR)
+    Divergences & spreads are in percentage points.
+    """
+    # Base prices for PTD
+    base_idx = df_hist[RSM1000].iloc[0]
+    base_ngn = df_hist[NGN].iloc[0]
+    base_whe = df_hist[WHEL].iloc[0]
+    base_ger = df_hist[GEAR].iloc[0]
+
+    # PTD returns
+    ptd_idx = df_hist[RSM1000] / base_idx - 1.0
+    ptd_ngn = df_hist[NGN]      / base_ngn - 1.0
+    ptd_whe = df_hist[WHEL]     / base_whe - 1.0
+    ptd_ger = df_hist[GEAR]     / base_ger - 1.0
+
+    # Divergences in % points
+    div_ngn = (ptd_ngn - beta_map[NGN]  * ptd_idx) * 100.0
+    div_whe = (ptd_whe - beta_map[WHEL] * ptd_idx) * 100.0
+    div_ger = (ptd_ger - beta_map[GEAR] * ptd_idx) * 100.0
+
+    # Historical spreads (first - second)
+    spread_ngn_whe = div_ngn - div_whe
+    spread_ngn_ger = div_ngn - div_ger
+    spread_whe_ger = div_whe - div_ger
+
+    def safe_sigma(series):
+        val = float(series.std(ddof=1))
+        return val if val > 1e-8 else 1.0
+
+    spread_stats = {
+        (NGN, WHEL): {
+            "mu": float(spread_ngn_whe.mean()),
+            "sigma": safe_sigma(spread_ngn_whe),
+        },
+        (NGN, GEAR): {
+            "mu": float(spread_ngn_ger.mean()),
+            "sigma": safe_sigma(spread_ngn_ger),
+        },
+        (WHEL, GEAR): {
+            "mu": float(spread_whe_ger.mean()),
+            "sigma": safe_sigma(spread_whe_ger),
+        },
+    }
+    return spread_stats
+
+def compute_spread_zscores(divs, spread_stats):
+    """
+    Given current divergences per ticker in % points:
+        divs = {NGN: div_ngn, WHEL: div_whe, GEAR: div_ger}
+    and spread_stats from compute_spread_stats, return z-scores
+    for each pair spread (first - second).
+    """
+    z_spreads = {}
+    for (a, b), stats in spread_stats.items():
+        mu = stats["mu"]
+        sigma = stats["sigma"] or 1.0
+        s = divs[a] - divs[b]  # spread = div_a - div_b (same convention as stats)
+        z_spreads[(a, b)] = (s - mu) / sigma
+    return z_spreads
 
 # ========= DYNAMIC PLOT (single figure, 3 lines) =========
-def init_live_plot(hist_ticks=None, hist_ngn=None, hist_whel=None, hist_gear=None, beta_map=None):
+def init_live_plot():
     plt.ion()  # interactive mode on
     fig, ax = plt.subplots()
-    # plot historical lines if provided, spaced and color-matched
-    if hist_ticks is not None and hist_ngn is not None and hist_whel is not None and hist_gear is not None:
-        ax.plot(hist_ticks[::5], hist_ngn[::5], '--', color='orange', alpha=0.3, linewidth=1.5,
-                label=f"NGN (Hist, β={beta_map['NGN']:.2f})" if beta_map else "NGN (Hist)")
-        ax.plot(hist_ticks[::5], hist_whel[::5], '--', color='blue', alpha=0.3, linewidth=1.5,
-                label=f"WHEL (Hist, β={beta_map['WHEL']:.2f})" if beta_map else "WHEL (Hist)")
-        ax.plot(hist_ticks[::5], hist_gear[::5], '--', color='green', alpha=0.3, linewidth=1.5,
-                label=f"GEAR (Hist, β={beta_map['GEAR']:.2f})" if beta_map else "GEAR (Hist)")
-    # create 3 empty lines for live data
-    line_ngn,  = ax.plot([], [], color='orange', label=f"NGN (Live, β={beta_map['NGN']:.2f})" if beta_map else "NGN (Live)")
-    line_whel, = ax.plot([], [], color='blue', label=f"WHEL (Live, β={beta_map['WHEL']:.2f})" if beta_map else "WHEL (Live)")
-    line_gear, = ax.plot([], [], color='green', label=f"GEAR (Live, β={beta_map['GEAR']:.2f})" if beta_map else "GEAR (Live)")
-    ax.set_title(r"Live & Historical Divergence vs Expected PTD ($\beta$ × RSM1000)")
+    # create 3 empty lines
+    line_ngn,  = ax.plot([], [], label="NGN")
+    line_whel, = ax.plot([], [], label="WHEL")
+    line_gear, = ax.plot([], [], label="GEAR")
+    ax.set_title(r"Live Divergence vs Expected PTD ($\beta$ x RSM1000)")
     ax.set_xlabel("Tick")
     ax.set_ylabel("Divergence (%)")
     ax.grid(True)
@@ -201,67 +254,15 @@ def update_live_plot(ax, line_ngn, line_whel, line_gear, ticks, series_ngn, seri
     ax.autoscale_view()
     plt.pause(0.01)  # let GUI process events
 
-def init_price_plot(hist_ticks=None, hist_prices=None, beta_map=None):
-    plt.ion()
-    fig, ax = plt.subplots()
-    # Plot historical prices (every 5th point for spacing)
-    if hist_ticks is not None and hist_prices is not None:
-        ax.plot(hist_ticks[::5], hist_prices['NGN'][::5], '--', color='orange', alpha=0.3, linewidth=1.5,
-                label=f"NGN (Hist)")
-        ax.plot(hist_ticks[::5], hist_prices['WHEL'][::5], '--', color='blue', alpha=0.3, linewidth=1.5,
-                label=f"WHEL (Hist)")
-        ax.plot(hist_ticks[::5], hist_prices['GEAR'][::5], '--', color='green', alpha=0.3, linewidth=1.5,
-                label=f"GEAR (Hist)")
-        ax.plot(hist_ticks[::5], hist_prices['RSM1000'][::5], '--', color='black', alpha=0.3, linewidth=1.5,
-                label=f"RSM1000 (Hist)")
-    # Create empty lines for live prices
-    line_ngn,  = ax.plot([], [], color='orange', label="NGN (Live)")
-    line_whel, = ax.plot([], [], color='blue', label="WHEL (Live)")
-    line_gear, = ax.plot([], [], color='green', label="GEAR (Live)")
-    line_idx,  = ax.plot([], [], color='black', label="RSM1000 (Live)")
-    ax.set_title("Live & Historical Price History")
-    ax.set_xlabel("Tick")
-    ax.set_ylabel("Price ($)")
-    ax.grid(True)
-    ax.legend()
-    fig.canvas.draw()
-    fig.canvas.flush_events()
-    return fig, ax, line_ngn, line_whel, line_gear, line_idx
-
-def update_price_plot(ax, line_ngn, line_whel, line_gear, line_idx, ticks, ngn, whel, gear, idx):
-    line_ngn.set_data(ticks, ngn)
-    line_whel.set_data(ticks, whel)
-    line_gear.set_data(ticks, gear)
-    line_idx.set_data(ticks, idx)
-    ax.relim()
-    ax.autoscale_view()
-    plt.pause(0.01)
-
 # ========= MAIN =========
 def main():
     # Load historical once to get betas
     df_hist = load_historical()
     if df_hist is None:
         return
-    beta_map = print_three_tables_and_betas(df_hist)   # dict with betas
-
-    # Calculate historical divergences
-    hist_ticks = df_hist["Tick"].values
-    ptd_idx_hist = (df_hist["RSM1000"] / df_hist["RSM1000"].iloc[0]) - 1.0
-    ptd_ngn_hist = (df_hist["NGN"] / df_hist["NGN"].iloc[0]) - 1.0
-    ptd_whel_hist = (df_hist["WHEL"] / df_hist["WHEL"].iloc[0]) - 1.0
-    ptd_gear_hist = (df_hist["GEAR"] / df_hist["GEAR"].iloc[0]) - 1.0
-    hist_ngn = (ptd_ngn_hist - beta_map["NGN"]  * ptd_idx_hist) * 100.0
-    hist_whel = (ptd_whel_hist - beta_map["WHEL"] * ptd_idx_hist) * 100.0
-    hist_gear = (ptd_gear_hist - beta_map["GEAR"] * ptd_idx_hist) * 100.0
-
-    # Prepare historical price arrays
-    hist_prices = {
-        'NGN': df_hist['NGN'].values,
-        'WHEL': df_hist['WHEL'].values,
-        'GEAR': df_hist['GEAR'].values,
-        'RSM1000': df_hist['RSM1000'].values
-    }
+    
+    beta_map, sigma_div, bases = compute_betas_and_div_sigma(df_hist)
+    spread_stats = compute_spread_stats(df_hist, beta_map)
 
     # Live PTD bases (first-seen mids)
     base_idx = None
@@ -273,22 +274,14 @@ def main():
     ticks = []
     div_ngn_list, div_whe_list, div_ger_list = [], [], []
 
-    # Buffers for live price plot
-    ticks_p = []
-    ngn_p, whel_p, gear_p, idx_p = [], [], [], []
-
-    # Init dynamic plot with historical data and beta values in legend
-    fig, ax, line_ngn, line_whel, line_gear = init_live_plot(
-        hist_ticks, hist_ngn, hist_whel, hist_gear, beta_map)
-
-    # Init price plot
-    fig_price, ax_price, line_ngn_p, line_whel_p, line_gear_p, line_idx_p = init_price_plot(
-        hist_ticks, hist_prices, beta_map)
+    # Init dynamic plot
+    fig, ax, line_ngn, line_whel, line_gear = init_live_plot()
 
     # Run while case active
     tick, status = get_tick_status()
-    while status == "ACTIVE":
 
+    minDiv, maxDiv = 0, 0
+    while status == "ACTIVE":
         # current mids
         mid_idx = mid_price(RSM1000)
         mid_ngn = mid_price(NGN)
@@ -304,12 +297,6 @@ def main():
         # compute PTDs only if all bases/mids exist
         if None not in (base_idx, base_ngn, base_whe, base_ger,
                         mid_idx,  mid_ngn,  mid_whe,  mid_ger):
-            
-            # Add current tick to historical data and recalculate betas
-            df_hist = add_tick_to_history(df_hist, tick, mid_idx, mid_ngn, mid_whe, mid_ger)
-            updated_betas = calculate_betas(df_hist)
-            if updated_betas is not None:
-                beta_map = updated_betas
 
             ptd_idx = (mid_idx / base_idx) - 1.0
             ptd_ngn = (mid_ngn / base_ngn) - 1.0
@@ -329,34 +316,41 @@ def main():
             update_live_plot(ax, line_ngn, line_whel, line_gear,
                              ticks, div_ngn_list, div_whe_list, div_ger_list)
 
-            # store + update price plot
-            ticks_p.append(tick)
-            ngn_p.append(mid_ngn)
-            whel_p.append(mid_whe)
-            gear_p.append(mid_ger)
-            idx_p.append(mid_idx)
-            update_price_plot(ax_price, line_ngn_p, line_whel_p, line_gear_p, line_idx_p,
-                             ticks_p, ngn_p, whel_p, gear_p, idx_p)
+            # current divergences dict (for spread tools)
+            divs = {
+                NGN: div_ngn,
+                WHEL: div_whe,
+                GEAR: div_ger,
+            }
 
-            # trade per symbol (simple mean-reversion)
-            # ======== Strat 1 ========
-            def trade_on_div(tkr, div_pct):
-                if div_pct > ENTRY_BAND_PCT and within_limits():
-                    place_mkt(tkr, "SELL", ORDER_SIZE)
-                elif div_pct < -ENTRY_BAND_PCT and within_limits():
-                    place_mkt(tkr, "BUY", ORDER_SIZE)
-                # ======== Strat 1.1 ========
-                elif abs(div_pct) < EXIT_BAND_PCT:
-                    pos = positions_map().get(tkr, 0)
-                    if pos > 0:
-                        place_mkt(tkr, "SELL", abs(pos))
-                    elif pos < 0:
-                        place_mkt(tkr, "BUY", abs(pos))
+            # determine the secuirity with the lowest and highest diveregence
+            sortedTickDivergences = sorted([(div_ngn, NGN), (div_whe, WHEL), (div_ger, GEAR)])
+            # fees = 0.01⋅2(L+S)=0.02(L+S)
+            betaRatio = abs(beta_map[sortedTickDivergences[-1][1]] / beta_map[sortedTickDivergences[0][1]])
 
-            trade_on_div(NGN,  div_ngn)
-            trade_on_div(WHEL, div_whe)
-            trade_on_div(GEAR, div_ger)
+            # per-security z-scores (based on divergence sigma)
+            z_map = {
+                NGN:  float(div_ngn / sigma_div[NGN]),
+                WHEL: float(div_whe / sigma_div[WHEL]),
+                GEAR: float(div_ger / sigma_div[GEAR]),
+            }
 
+            # spread z-scores (based on historical spread stats)
+            spread_z_map = compute_spread_zscores(divs, spread_stats)
+            # e.g. spread_z_map[(NGN, WHEL)], spread_z_map[(NGN, GEAR)], spread_z_map[(WHEL, GEAR)]
+
+            # example stock-based scaling (you can replace with spread_z_map logic if you want)
+            currSpreadZScore = spread_z_map[(sortedTickDivergences[0][1], sortedTickDivergences[-1][1])]
+            intensity = max(0.0, min(1.0, (currSpreadZScore - MIN_SPREAD_ZSCORE) / (MAX_SPREAD_ZSCORE - MIN_SPREAD_ZSCORE)))
+            largerBuy = int(MIN_SHARES + intensity * (MAX_SHARES - MIN_SHARES))
+            largerBuy = max(MIN_SHARES, min(largerBuy, MAX_SHARES, MAX_TRADE_SIZE))
+
+            smallerBuy = largerBuy 
+            largerCost = FEE_MKT * 2 * largerBuy * (1 + betaRatio)
+
+            minDiv, maxDiv = min(minDiv, sortedTickDivergences[0][0]), max(maxDiv, sortedTickDivergences[-1][0])
+            print(minDiv, maxDiv)
+            
         sleep(SLEEP_SEC)
         tick, status = get_tick_status()
 
