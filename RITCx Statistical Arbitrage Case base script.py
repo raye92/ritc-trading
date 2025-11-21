@@ -45,9 +45,9 @@ SLEEP_SEC       = 0.25
 PRINT_HEARTBEAT = True
 
 
-MIN_SPREAD_ZSCORE = 1   #  (start trading here)
-MAX_SPREAD_ZSCORE = 2     # (full size here)
-EXIT_SPREAD_ZSCORE = 0.5  # (exit trades below this)
+MIN_SPREAD_ZSCORE = 1.5   #  (start trading here)
+MAX_SPREAD_ZSCORE = 3     # (full size here)
+EXIT_SPREAD_ZSCORE = 1.4  # (exit trades below this)
 
 # ========= SESSION =========
 s = requests.Session()
@@ -227,6 +227,48 @@ def compute_spread_zscores(divs, spread_stats):
         z_spreads[(a, b)] = (s - mu) / sigma
     return z_spreads
 
+# ========= NEW: HISTORICAL SPREAD Z-SCORES (FOR PLOTTING) =========
+def compute_historical_spread_zscores(df_hist: pd.DataFrame, beta_map, spread_stats):
+    """
+    Compute per-tick historical spread z-scores for each pair using
+    the same spread definitions and spread_stats.
+    Returns:
+        hist_ticks: list of ticks
+        hist_spread_z: dict[(a,b)] -> list of z-scores
+    """
+    base_idx = df_hist[RSM1000].iloc[0]
+    base_ngn = df_hist[NGN].iloc[0]
+    base_whe = df_hist[WHEL].iloc[0]
+    base_ger = df_hist[GEAR].iloc[0]
+
+    ptd_idx = df_hist[RSM1000] / base_idx - 1.0
+    ptd_ngn = df_hist[NGN]      / base_ngn - 1.0
+    ptd_whe = df_hist[WHEL]     / base_whe - 1.0
+    ptd_ger = df_hist[GEAR]     / base_ger - 1.0
+
+    div_ngn = (ptd_ngn - beta_map[NGN]  * ptd_idx) * 100.0
+    div_whe = (ptd_whe - beta_map[WHEL] * ptd_idx) * 100.0
+    div_ger = (ptd_ger - beta_map[GEAR] * ptd_idx) * 100.0
+
+    spread_ngn_whe = div_ngn - div_whe
+    spread_ger_ngn = div_ger - div_ngn
+    spread_ger_whe = div_ger - div_whe
+
+    hist_spread_z = {}
+
+    for (a, b), series in [
+        ((NGN, WHEL), spread_ngn_whe),
+        ((GEAR, NGN), spread_ger_ngn),
+        ((GEAR, WHEL), spread_ger_whe),
+    ]:
+        mu = spread_stats[(a, b)]["mu"]
+        sigma = spread_stats[(a, b)]["sigma"] or 1.0
+        z = (series - mu) / sigma
+        hist_spread_z[(a, b)] = z.tolist()
+
+    hist_ticks = df_hist["Tick"].tolist()
+    return hist_ticks, hist_spread_z
+
 # ========= DYNAMIC PLOT (single figure, 3 lines) =========
 def init_live_plot():
     plt.ion()  # interactive mode on
@@ -254,6 +296,50 @@ def update_live_plot(ax, line_ngn, line_whel, line_gear, ticks, series_ngn, seri
     ax.autoscale_view()
     plt.pause(0.01)  # let GUI process events
 
+# ========= NEW: SPREAD Z-SCORE PLOT (LIVE + HISTORICAL) =========
+def init_spread_z_plot(hist_ticks, hist_spread_z):
+    """
+    Initialize a figure for spread z-scores:
+      - dotted lines: historical z-scores
+      - solid lines: live z-scores (initially empty)
+    """
+    plt.ion()
+    fig, ax = plt.subplots()
+
+    # Historical (dotted) lines
+    ax.plot(hist_ticks, hist_spread_z[(NGN, WHEL)], linestyle=":", label="NGN-WHEL (hist)")
+    ax.plot(hist_ticks, hist_spread_z[(GEAR, NGN)], linestyle=":", label="GEAR-NGN (hist)")
+    ax.plot(hist_ticks, hist_spread_z[(GEAR, WHEL)], linestyle=":", label="GEAR-WHEL (hist)")
+
+    # Live lines (initially empty)
+    line_ngn_whel_live, = ax.plot([], [], label="NGN-WHEL (live)")
+    line_gear_ngn_live, = ax.plot([], [], label="GEAR-NGN (live)")
+    line_gear_whel_live, = ax.plot([], [], label="GEAR-WHEL (live)")
+
+    ax.set_title("Spread Z-Scores (live vs historical)")
+    ax.set_xlabel("Tick")
+    ax.set_ylabel("Z-Score")
+    ax.grid(True)
+    ax.legend()
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+    return fig, ax, line_ngn_whel_live, line_gear_ngn_live, line_gear_whel_live
+
+def update_spread_z_plot(ax,
+                         line_ngn_whel,
+                         line_gear_ngn,
+                         line_gear_whel,
+                         ticks,
+                         z_ngn_whel,
+                         z_gear_ngn,
+                         z_gear_whel):
+    line_ngn_whel.set_data(ticks, z_ngn_whel)
+    line_gear_ngn.set_data(ticks, z_gear_ngn)
+    line_gear_whel.set_data(ticks, z_gear_whel)
+    ax.relim()
+    ax.autoscale_view()
+    plt.pause(0.01)
+
 # ========= MAIN =========
 def main():
     # Load historical once to get betas
@@ -263,6 +349,9 @@ def main():
     
     beta_map, sigma_div, bases = compute_betas_and_div_sigma(df_hist)
     spread_stats = compute_spread_stats(df_hist, beta_map)
+
+    # NEW: pre-compute historical spread z-scores for plotting
+    hist_ticks, hist_spread_z = compute_historical_spread_zscores(df_hist, beta_map, spread_stats)
 
     # Live PTD bases (first-seen mids)
     base_idx = None
@@ -274,17 +363,31 @@ def main():
     ticks = []
     div_ngn_list, div_whe_list, div_ger_list = [], [], []
 
-    # Init dynamic plot
+    # NEW: data buffers for live spread z-score plot
+    spread_ticks = []
+    spread_ngn_whel_z_list = []
+    spread_gear_ngn_z_list = []
+    spread_gear_whel_z_list = []
+
+    # Init dynamic plots
     fig, ax, line_ngn, line_whel, line_gear = init_live_plot()
+    fig_spread, ax_spread, line_ngn_whel_live, line_gear_ngn_live, line_gear_whel_live = init_spread_z_plot(
+        hist_ticks, hist_spread_z
+    )
 
     # Run while case active
     tick, status = get_tick_status()
 
     minDiv, maxDiv = 0, 0
 
+    seenTicks  = set()
+
     openPositions = {(NGN, WHEL): {NGN: 0, WHEL: 0}, (GEAR, WHEL): {WHEL: 0, GEAR: 0}, (GEAR, NGN): {NGN: 0, GEAR: 0}}
 
     while status == "ACTIVE":
+        if tick in seenTicks:
+            tick, status = get_tick_status()
+            continue
         # current mids
         mid_idx = mid_price(RSM1000)
         mid_ngn = mid_price(NGN)
@@ -334,18 +437,39 @@ def main():
             spread_z_map = compute_spread_zscores(divs, spread_stats)
             # e.g. spread_z_map[(NGN, WHEL)], spread_z_map[(NGN, GEAR)], spread_z_map[(WHEL, GEAR)]
 
-            # example stock-based scaling (you can replace with spread_z_map logic if you want)
-            currSpreadZScore = spread_z_map[tuple(sorted([sortedTickDivergences[0][1], sortedTickDivergences[-1][1]]))] 
-            intensity = max(0.0, min(1.0, (currSpreadZScore - MIN_SPREAD_ZSCORE) / (MAX_SPREAD_ZSCORE - MIN_SPREAD_ZSCORE)))
-            largerBuySz = int(ORDER_SIZE + intensity * (MAX_TRADE_SIZE - ORDER_SIZE))
-            largerBuySz = max(ORDER_SIZE, min(largerBuySz, MAX_TRADE_SIZE))
+            # NEW: update live spread z-score plot
+            spread_ticks.append(tick)
+            z1, z2, z3 = spread_z_map[(NGN, WHEL)], spread_z_map[(GEAR, NGN)], spread_z_map[(GEAR, WHEL)]
+            spread_ngn_whel_z_list.append(z1)
+            spread_gear_ngn_z_list.append(z2)
+            spread_gear_whel_z_list.append(z3)
+            update_spread_z_plot(
+                ax_spread,
+                line_ngn_whel_live,
+                line_gear_ngn_live,
+                line_gear_whel_live,
+                spread_ticks,
+                spread_ngn_whel_z_list,
+                spread_gear_ngn_z_list,
+                spread_gear_whel_z_list,
+            )
 
-            if abs(divs[sortedTickDivergences[-1][1]]) > abs(divs[sortedTickDivergences[0][1]]):
-                largerBuyTkr = sortedTickDivergences[-1][1]
-                smallerBuyTkr = sortedTickDivergences[0][1]
+            currSpread, currSpreadZScore  = max(spread_z_map.items(), key=lambda kv: abs(kv[1]))
+
+            largerBuyTkr = max(currSpread, key = lambda t: abs(divs[t]))
+            if largerBuyTkr == currSpread[0]:
+                smallerBuyTkr = currSpread[1]
             else:
-                largerBuyTkr = sortedTickDivergences[0][1]
-                smallerBuyTkr = sortedTickDivergences[-1][1]
+                smallerBuyTkr = currSpread[0]
+
+            intensity = max(0.0, min(1.0, (abs(currSpreadZScore) - MIN_SPREAD_ZSCORE) / (MAX_SPREAD_ZSCORE - MIN_SPREAD_ZSCORE)))
+            largerBuySz = int( intensity * (MAX_TRADE_SIZE))
+            
+            
+            if mid_price(smallerBuyTkr) is None or mid_price(largerBuyTkr) is None:
+                seenTicks.add(tick)
+                tick, status = get_tick_status()
+                continue
 
             largerBuyDollars = largerBuySz * mid_price(largerBuyTkr)
             betaRatio = abs(beta_map[largerBuyTkr] / beta_map[smallerBuyTkr])
@@ -364,40 +488,41 @@ def main():
             # Place trades
             if within_limits():
                 if divs[largerBuyTkr] > divs[smallerBuyTkr]:
-                    place_mkt(largerBuyTkr, "BUY", largerBuySz)
-                    place_mkt(smallerBuyTkr, "SELL", smallerBuysz)
-                    openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][largerBuyTkr] += largerBuySz
-                    openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][smallerBuyTkr] -= smallerBuysz
+                    if place_mkt(largerBuyTkr, "BUY", largerBuySz):
+                        openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][largerBuyTkr] += largerBuySz
+                    if place_mkt(smallerBuyTkr, "SELL", smallerBuysz):
+                        openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][smallerBuyTkr] -= smallerBuysz
                 else:
-                    place_mkt(largerBuyTkr, "SELL", largerBuySz)
-                    place_mkt(smallerBuyTkr, "BUY", smallerBuysz)
-                    openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][largerBuyTkr] -= largerBuySz
-                    openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][smallerBuyTkr] += smallerBuysz
+                    if place_mkt(largerBuyTkr, "SELL", largerBuySz):
+                        openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][largerBuyTkr] -= largerBuySz
+                    if place_mkt(smallerBuyTkr, "BUY", smallerBuysz):
+                        openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][smallerBuyTkr] += smallerBuysz
 
             # close positions on spreads close to 0:   
             for (a, b), z_score in spread_z_map.items():
                 if abs(z_score) < EXIT_SPREAD_ZSCORE:
                     spreadPositions = openPositions[(a, b)]
-                    if spreadPositions[a] > 0:
-                        place_mkt(a, "SELL", abs(spreadPositions[a]))
-                    elif spreadPositions[a] < 0:
-                        place_mkt(a, "BUY", abs(spreadPositions[a]))
-                    if spreadPositions[b] > 0:
-                        place_mkt(b, "SELL", abs(spreadPositions[b]))
-                    elif spreadPositions[b] < 0:
-                        place_mkt(b, "BUY", abs(spreadPositions[b]))
-                    openPositions[(a, b)] = {a: 0, b: 0}
+                    if spreadPositions[a] > 0 and place_mkt(a, "SELL", abs(spreadPositions[a])):
+                        spreadPositions[a] = 0
+                    elif spreadPositions[a] < 0 and place_mkt(a, "BUY", abs(spreadPositions[a])):
+                        spreadPositions[a] = 0
+                    if spreadPositions[b] > 0 and place_mkt(b, "SELL", abs(spreadPositions[b])):
+                            spreadPositions[b] = 0
+                    elif spreadPositions[b] < 0 and place_mkt(b, "BUY", abs(spreadPositions[b])):
+                        spreadPositions[b] = 0
+                    openPositions[(a, b)] = spreadPositions
+                
+            seenTicks.add(tick)
             
-            print(openPositions)
-                    
-            
-            """
-            # trade per symbol (simple mean-reversion)
-            def trade_on_div(tkr, div_pct):
-                if div_pct > ENTRY_BAND_PCT and within_limits():
-                    place_mkt(tkr, "SELL", ORDER_SIZE)
-                elif div_pct < -ENTRY_BAND_PCT and within_limits():
-                    place_mkt(tkr, "BUY", ORDER_SIZE)"""
+        print(tick, openPositions)  
+        
+        """
+        # trade per symbol (simple mean-reversion)
+        def trade_on_div(tkr, div_pct):
+            if div_pct > ENTRY_BAND_PCT and within_limits():
+                place_mkt(tkr, "SELL", ORDER_SIZE)
+            elif div_pct < -ENTRY_BAND_PCT and within_limits():
+                place_mkt(tkr, "BUY", ORDER_SIZE)"""
 
         sleep(SLEEP_SEC)
         tick, status = get_tick_status()
