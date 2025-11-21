@@ -45,9 +45,9 @@ SLEEP_SEC       = 0.25
 PRINT_HEARTBEAT = True
 
 
-MIN_SPREAD_ZSCORE = 1.5   #  (start trading here)
+MIN_SPREAD_ZSCORE = 2   #  (start trading here)
 MAX_SPREAD_ZSCORE = 3     # (full size here)
-EXIT_SPREAD_ZSCORE = 1.4  # (exit trades below this)
+EXIT_SPREAD_ZSCORE = 0.5  # (exit trades below this)
 
 # ========= SESSION =========
 s = requests.Session()
