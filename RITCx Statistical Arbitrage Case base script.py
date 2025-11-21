@@ -255,7 +255,9 @@ class BetaNeutralTrade:
     status: str = "OPEN"
     reason: str = ""
     realized_pnl: float = 0.0
-
+    # +1 means we bought (long) this ticker when entering; -1 means we sold (short)
+    long_side: int = 1
+    short_side: int = -1
     def unrealized_pnl(self, price_map: Dict[str, float]) -> float:
         long_price = price_map.get(self.long_ticker)
         short_price = price_map.get(self.short_ticker)
@@ -287,6 +289,8 @@ class BetaNeutralTrade:
             "exit_tick": self.exit_tick,
             "reason": self.reason,
             "realized_pnl": self.realized_pnl,
+            "long_side": self.long_side,
+            "short_side": self.short_side,
         }
 
 
@@ -393,8 +397,23 @@ def enter_beta_neutral_trade(tick: int, long_tkr: str, short_tkr: str,
         print("[SIZING] Unable to size beta-neutral trade.")
         return None
     long_qty, short_qty = qtys
-    ok_long = place_mkt(long_tkr, "BUY", long_qty)
-    ok_short = place_mkt(short_tkr, "SELL", short_qty)
+    # Determine actions based on beta signs so resulting beta exposure cancels
+    beta_long = beta_map.get(long_tkr, 0.0)
+    beta_short = beta_map.get(short_tkr, 0.0)
+
+    # Default intention: long the undervalued ticker (buy), short the overvalued (sell)
+    long_side = 1  # +1 => BUY, -1 => SELL
+    # If betas have the same sign, keep the conventional long/short sides; if opposite, flip so both sides use same action
+    if beta_long * beta_short >= 0:
+        short_side = -1
+    else:
+        short_side = 1
+
+    action_long = "BUY" if long_side > 0 else "SELL"
+    action_short = "BUY" if short_side > 0 else "SELL"
+
+    ok_long = place_mkt(long_tkr, action_long, long_qty)
+    ok_short = place_mkt(short_tkr, action_short, short_qty)
     if ok_long and ok_short:
         trade = BetaNeutralTrade(
             long_ticker=long_tkr,
@@ -405,6 +424,8 @@ def enter_beta_neutral_trade(tick: int, long_tkr: str, short_tkr: str,
             short_entry=price_map[short_tkr],
             entry_tick=tick,
             entry_spread=entry_spread,
+            long_side=long_side,
+            short_side=short_side,
         )
         long_value = trade.long_qty * trade.long_entry
         short_value = trade.short_qty * trade.short_entry
@@ -429,8 +450,11 @@ def scale_in_beta_neutral_trade(trade: BetaNeutralTrade, tick: int,
     if qtys is None:
         return False
     add_long_qty, add_short_qty = qtys
-    ok_long = place_mkt(trade.long_ticker, "BUY", add_long_qty)
-    ok_short = place_mkt(trade.short_ticker, "SELL", add_short_qty)
+    # Use the same sides as the original trade when scaling
+    action_long = "BUY" if trade.long_side > 0 else "SELL"
+    action_short = "BUY" if trade.short_side > 0 else "SELL"
+    ok_long = place_mkt(trade.long_ticker, action_long, add_long_qty)
+    ok_short = place_mkt(trade.short_ticker, action_short, add_short_qty)
     if ok_long and ok_short:
         # Update trade with new quantities (weighted average entry price)
         total_long_qty = trade.long_qty + add_long_qty
@@ -453,8 +477,11 @@ def scale_in_beta_neutral_trade(trade: BetaNeutralTrade, tick: int,
 
 
 def exit_beta_neutral_trade(trade: BetaNeutralTrade, tick: int, price_map: Dict[str, float], reason: str) -> float:
-    ok_long = place_mkt(trade.long_ticker, "SELL", trade.long_qty)
-    ok_short = place_mkt(trade.short_ticker, "BUY", trade.short_qty)
+    # To exit, reverse the original side: if we originally BUY (long_side=+1), exit by SELL; if originally SELL, exit by BUY
+    action_long = "SELL" if trade.long_side > 0 else "BUY"
+    action_short = "SELL" if trade.short_side > 0 else "BUY"
+    ok_long = place_mkt(trade.long_ticker, action_long, trade.long_qty)
+    ok_short = place_mkt(trade.short_ticker, action_short, trade.short_qty)
     pnl = trade.unrealized_pnl(price_map)
     trade.exit_tick = tick
     trade.status = "CLOSED"
