@@ -33,12 +33,15 @@ API_KEY = os.getenv("API_KEY", "Rotman")
 HDRS = {"X-API-key": API_KEY}
 
 NGN, WHEL, GEAR, RSM1000 = "NGN", "WHEL", "GEAR", "RSM1000"
+SPREAD_PAIRS = [(NGN, WHEL), (GEAR, NGN), (GEAR, WHEL)]
 
 FEE_MKT = 0.01          # $/share (market)
 ORDER_SIZE      = 5000
 MAX_TRADE_SIZE  = 10_000
 GROSS_LIMIT_SH  = 500_000
 NET_LIMIT_SH    = 100_000
+GROSS_LIMIT_USD = 20_000_000   # approximate gross dollar cap
+NET_LIMIT_USD   = 4_000_000    # approximate net dollar cap
 ENTRY_BAND_PCT = 0.6   # enter if |div| > 0.6%  (div > 0.6)
 EXIT_BAND_PCT  = 0.25  # flatten once |div| < 0.25%
 SLEEP_SEC       = 0.25
@@ -48,6 +51,7 @@ PRINT_HEARTBEAT = True
 MIN_SPREAD_ZSCORE = 2   #  (start trading here)
 MAX_SPREAD_ZSCORE = 3     # (full size here)
 EXIT_SPREAD_ZSCORE = 0.5  # (exit trades below this)
+TRANSACTION_COST_Z_BUFFER = 0.25  # minimum extra z to cover fees
 
 # ========= SESSION =========
 s = requests.Session()
@@ -80,7 +84,12 @@ def positions_map():
     return out
 
 def place_mkt(ticker, action, qty):
-    qty = int(max(1, min(qty, MAX_TRADE_SIZE)))
+    qty = int(qty)
+    if qty <= 0:
+        if PRINT_HEARTBEAT:
+            print(f"SKIP ORDER {action} {ticker} qty<=0")
+        return False
+    qty = int(min(qty, MAX_TRADE_SIZE))
     r = s.post(f"{API}/orders",
                params={"ticker": ticker, "type": "MARKET",
                        "quantity": qty, "action": action})
@@ -88,11 +97,29 @@ def place_mkt(ticker, action, qty):
         print(f"ORDER {action} {qty} {ticker} -> {'OK' if r.ok else 'FAIL'}")
     return r.ok
 
-def within_limits():
-    pos = positions_map()
-    gross = abs(pos[NGN]) + abs(pos[WHEL]) + abs(pos[GEAR])
-    net   = pos[NGN] + pos[WHEL] + pos[GEAR]
-    return ((gross) < GROSS_LIMIT_SH) and (abs(net) < NET_LIMIT_SH)
+def within_limits(pos=None, price_map=None):
+    if pos is None:
+        pos = positions_map()
+    if price_map is None:
+        price_map = {}
+    def px(tkr):
+        return price_map.get(tkr) if price_map and price_map.get(tkr) is not None else mid_price(tkr) or 0.0
+    gross_shares = abs(pos[NGN]) + abs(pos[WHEL]) + abs(pos[GEAR])
+    net_shares = pos[NGN] + pos[WHEL] + pos[GEAR]
+    gross_dollars = sum(abs(pos[t]) * px(t) for t in (NGN, WHEL, GEAR))
+    net_dollars = sum(pos[t] * px(t) for t in (NGN, WHEL, GEAR))
+    within_share_limits = (gross_shares < GROSS_LIMIT_SH) and (abs(net_shares) < NET_LIMIT_SH)
+    within_dollar_limits = (gross_dollars < GROSS_LIMIT_USD) and (abs(net_dollars) < NET_LIMIT_USD)
+    return within_share_limits and within_dollar_limits
+
+def flatten_position_from_snapshot(ticker, pos_snapshot):
+    qty = pos_snapshot.get(ticker, 0)
+    if qty > 0:
+        if place_mkt(ticker, "SELL", qty):
+            pos_snapshot[ticker] = 0
+    elif qty < 0:
+        if place_mkt(ticker, "BUY", abs(qty)):
+            pos_snapshot[ticker] = 0
 
 # ========= HISTORICAL (tables + betas) =========
 def load_historical():
@@ -378,11 +405,7 @@ def main():
     # Run while case active
     tick, status = get_tick_status()
 
-    minDiv, maxDiv = 0, 0
-
     seenTicks  = set()
-
-    openPositions = {(NGN, WHEL): {NGN: 0, WHEL: 0}, (GEAR, WHEL): {WHEL: 0, GEAR: 0}, (GEAR, NGN): {NGN: 0, GEAR: 0}}
 
     while status == "ACTIVE":
         if tick in seenTicks:
@@ -429,10 +452,6 @@ def main():
                 GEAR: div_ger,
             }
 
-            # determine the secuirity with the lowest and highest diveregence
-            sortedTickDivergences = sorted([(div_ngn, NGN), (div_whe, WHEL), (div_ger, GEAR)])
-            # fees = 0.01⋅2(L+S)=0.02(L+S)
-
             # spread z-scores (based on historical spread stats)
             spread_z_map = compute_spread_zscores(divs, spread_stats)
             # e.g. spread_z_map[(NGN, WHEL)], spread_z_map[(NGN, GEAR)], spread_z_map[(WHEL, GEAR)]
@@ -454,67 +473,62 @@ def main():
                 spread_gear_whel_z_list,
             )
 
-            currSpread, currSpreadZScore  = max(spread_z_map.items(), key=lambda kv: abs(kv[1]))
+            price_map = {NGN: mid_ngn, WHEL: mid_whe, GEAR: mid_ger}
+            pos_snapshot = positions_map()
 
-            largerBuyTkr = max(currSpread, key = lambda t: abs(divs[t]))
-            if largerBuyTkr == currSpread[0]:
-                smallerBuyTkr = currSpread[1]
-            else:
-                smallerBuyTkr = currSpread[0]
-
-            intensity = max(0.0, min(1.0, (abs(currSpreadZScore) - MIN_SPREAD_ZSCORE) / (MAX_SPREAD_ZSCORE - MIN_SPREAD_ZSCORE)))
-            largerBuySz = int( intensity * (MAX_TRADE_SIZE))
-            
-            
-            if mid_price(smallerBuyTkr) is None or mid_price(largerBuyTkr) is None:
+            if not within_limits(pos_snapshot, price_map):
                 seenTicks.add(tick)
                 tick, status = get_tick_status()
                 continue
 
-            largerBuyDollars = largerBuySz * mid_price(largerBuyTkr)
-            betaRatio = abs(beta_map[largerBuyTkr] / beta_map[smallerBuyTkr])
+            currSpread, currSpreadZScore  = max(spread_z_map.items(), key=lambda kv: abs(kv[1]))
+            abs_z = abs(currSpreadZScore)
 
-            smallerBuyDollars = largerBuyDollars / betaRatio
-            smallerBuysz = int(smallerBuyDollars / mid_price(smallerBuyTkr))
+            if abs_z < (MIN_SPREAD_ZSCORE + TRANSACTION_COST_Z_BUFFER):
+                seenTicks.add(tick)
+                tick, status = get_tick_status()
+                continue
 
-            if smallerBuysz > MAX_TRADE_SIZE:
-                reductionFactor = smallerBuysz / MAX_TRADE_SIZE
-                smallerBuysz = MAX_TRADE_SIZE
-                largerBuySz = int(largerBuySz / reductionFactor)
+            denom = max(1e-6, (MAX_SPREAD_ZSCORE - MIN_SPREAD_ZSCORE))
+            intensity = max(0.0, min(1.0, (abs_z - MIN_SPREAD_ZSCORE) / denom))
+            if intensity <= 0.0:
+                seenTicks.add(tick)
+                tick, status = get_tick_status()
+                continue
 
-            # maybe add a second guard for buying depending on costs of making trade rather than purely likelyhood
-            # of spread
+            base_qty = int(round(intensity * MAX_TRADE_SIZE))
+            if base_qty <= 0:
+                seenTicks.add(tick)
+                tick, status = get_tick_status()
+                continue
 
-            # Place trades
-            if within_limits():
-                if divs[largerBuyTkr] > divs[smallerBuyTkr]:
-                    if place_mkt(largerBuyTkr, "BUY", largerBuySz):
-                        openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][largerBuyTkr] += largerBuySz
-                    if place_mkt(smallerBuyTkr, "SELL", smallerBuysz):
-                        openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][smallerBuyTkr] -= smallerBuysz
-                else:
-                    if place_mkt(largerBuyTkr, "SELL", largerBuySz):
-                        openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][largerBuyTkr] -= largerBuySz
-                    if place_mkt(smallerBuyTkr, "BUY", smallerBuysz):
-                        openPositions[tuple(sorted([largerBuyTkr, smallerBuyTkr]))][smallerBuyTkr] += smallerBuysz
+            a, b = currSpread  # spread = divs[a] - divs[b]
+            beta_b = beta_map.get(b, 1.0)
+            beta_ratio = abs(beta_map.get(a, 1.0) / beta_b) if abs(beta_b) > 1e-6 else 1.0
+            hedge_qty = max(1, int(round(base_qty * beta_ratio)))
+            hedge_qty = min(hedge_qty, MAX_TRADE_SIZE)
 
-            # close positions on spreads close to 0:   
+            if currSpreadZScore > 0:
+                legs = ((a, "SELL", base_qty), (b, "BUY", hedge_qty))
+            else:
+                legs = ((a, "BUY", base_qty), (b, "SELL", hedge_qty))
+
+            if within_limits(pos_snapshot, price_map):
+                for tkr, action, qty in legs:
+                    if place_mkt(tkr, action, qty):
+                        # refresh snapshot so risk checks stay current
+                        pos_snapshot = positions_map()
+
+            # close positions on spreads close to 0 using actual positions
+            latest_positions = positions_map()
             for (a, b), z_score in spread_z_map.items():
                 if abs(z_score) < EXIT_SPREAD_ZSCORE:
-                    spreadPositions = openPositions[(a, b)]
-                    if spreadPositions[a] > 0 and place_mkt(a, "SELL", abs(spreadPositions[a])):
-                        spreadPositions[a] = 0
-                    elif spreadPositions[a] < 0 and place_mkt(a, "BUY", abs(spreadPositions[a])):
-                        spreadPositions[a] = 0
-                    if spreadPositions[b] > 0 and place_mkt(b, "SELL", abs(spreadPositions[b])):
-                            spreadPositions[b] = 0
-                    elif spreadPositions[b] < 0 and place_mkt(b, "BUY", abs(spreadPositions[b])):
-                        spreadPositions[b] = 0
-                    openPositions[(a, b)] = spreadPositions
-                
+                    flatten_position_from_snapshot(a, latest_positions)
+                    flatten_position_from_snapshot(b, latest_positions)
+            
             seenTicks.add(tick)
             
-        print(tick, openPositions)  
+        print(tick)
         
         """
         # trade per symbol (simple mean-reversion)
