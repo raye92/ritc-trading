@@ -40,8 +40,6 @@ ORDER_SIZE      = 5000
 MAX_TRADE_SIZE  = 10_000
 GROSS_LIMIT_SH  = 500_000
 NET_LIMIT_SH    = 100_000
-GROSS_LIMIT_USD = 20_000_000   # approximate gross dollar cap
-NET_LIMIT_USD   = 4_000_000    # approximate net dollar cap
 ENTRY_BAND_PCT = 0.6   # enter if |div| > 0.6%  (div > 0.6)
 EXIT_BAND_PCT  = 0.25  # flatten once |div| < 0.25%
 SLEEP_SEC       = 0.25
@@ -52,6 +50,7 @@ MIN_SPREAD_ZSCORE = 2   #  (start trading here)
 MAX_SPREAD_ZSCORE = 3     # (full size here)
 EXIT_SPREAD_ZSCORE = 0.5  # (exit trades below this)
 TRANSACTION_COST_Z_BUFFER = 0.25  # minimum extra z to cover fees
+RECONCILE_TICK_INTERVAL = 10      # how often to sync spread vs real positions
 
 # ========= SESSION =========
 s = requests.Session()
@@ -97,29 +96,37 @@ def place_mkt(ticker, action, qty):
         print(f"ORDER {action} {qty} {ticker} -> {'OK' if r.ok else 'FAIL'}")
     return r.ok
 
-def within_limits(pos=None, price_map=None):
+def within_limits(pos=None):
     if pos is None:
         pos = positions_map()
-    if price_map is None:
-        price_map = {}
-    def px(tkr):
-        return price_map.get(tkr) if price_map and price_map.get(tkr) is not None else mid_price(tkr) or 0.0
     gross_shares = abs(pos[NGN]) + abs(pos[WHEL]) + abs(pos[GEAR])
     net_shares = pos[NGN] + pos[WHEL] + pos[GEAR]
-    gross_dollars = sum(abs(pos[t]) * px(t) for t in (NGN, WHEL, GEAR))
-    net_dollars = sum(pos[t] * px(t) for t in (NGN, WHEL, GEAR))
-    within_share_limits = (gross_shares < GROSS_LIMIT_SH) and (abs(net_shares) < NET_LIMIT_SH)
-    within_dollar_limits = (gross_dollars < GROSS_LIMIT_USD) and (abs(net_dollars) < NET_LIMIT_USD)
-    return within_share_limits and within_dollar_limits
+    return (gross_shares < GROSS_LIMIT_SH) and (abs(net_shares) < NET_LIMIT_SH)
 
-def flatten_position_from_snapshot(ticker, pos_snapshot):
-    qty = pos_snapshot.get(ticker, 0)
-    if qty > 0:
-        if place_mkt(ticker, "SELL", qty):
-            pos_snapshot[ticker] = 0
-    elif qty < 0:
-        if place_mkt(ticker, "BUY", abs(qty)):
-            pos_snapshot[ticker] = 0
+def aggregate_spread_positions(spread_positions):
+    agg = {NGN: 0, WHEL: 0, GEAR: 0}
+    for pair in SPREAD_PAIRS:
+        legs = spread_positions.get(pair, {})
+        for tkr in pair:
+            agg[tkr] += legs.get(tkr, 0)
+    return agg
+
+def reconcile_spread_positions(spread_positions, true_positions):
+    agg = aggregate_spread_positions(spread_positions)
+    for tkr in (NGN, WHEL, GEAR):
+        diff = true_positions.get(tkr, 0) - agg.get(tkr, 0)
+        if diff == 0:
+            continue
+        related_pairs = [pair for pair in SPREAD_PAIRS if tkr in pair]
+        if not related_pairs:
+            continue
+        # adjust the pair currently holding the largest abs exposure for that ticker
+        target_pair = max(related_pairs,
+                          key=lambda pair: abs(spread_positions[pair].get(tkr, 0)))
+        spread_positions[target_pair][tkr] = spread_positions[target_pair].get(tkr, 0) + diff
+        agg[tkr] += diff
+        if PRINT_HEARTBEAT:
+            print(f"RECONCILE {tkr}: adjusted {target_pair} by {diff} to match positions_map")
 
 # ========= HISTORICAL (tables + betas) =========
 def load_historical():
@@ -406,6 +413,8 @@ def main():
     tick, status = get_tick_status()
 
     seenTicks  = set()
+    ticks_processed = 0
+    spread_positions = {pair: {pair[0]: 0, pair[1]: 0} for pair in SPREAD_PAIRS}
 
     while status == "ACTIVE":
         if tick in seenTicks:
@@ -473,60 +482,72 @@ def main():
                 spread_gear_whel_z_list,
             )
 
-            price_map = {NGN: mid_ngn, WHEL: mid_whe, GEAR: mid_ger}
             pos_snapshot = positions_map()
 
-            if not within_limits(pos_snapshot, price_map):
-                seenTicks.add(tick)
-                tick, status = get_tick_status()
-                continue
+            eligible_spreads = []
+            for pair in SPREAD_PAIRS:
+                z_score = spread_z_map.get(pair)
+                if z_score is None:
+                    continue
+                abs_z = abs(z_score)
+                if abs_z >= (MIN_SPREAD_ZSCORE + TRANSACTION_COST_Z_BUFFER):
+                    eligible_spreads.append((abs_z, pair, z_score))
 
-            currSpread, currSpreadZScore  = max(spread_z_map.items(), key=lambda kv: abs(kv[1]))
-            abs_z = abs(currSpreadZScore)
+            eligible_spreads.sort(key=lambda x: x[0], reverse=True)
 
-            if abs_z < (MIN_SPREAD_ZSCORE + TRANSACTION_COST_Z_BUFFER):
-                seenTicks.add(tick)
-                tick, status = get_tick_status()
-                continue
+            for abs_z, pair, z_score in eligible_spreads:
+                if not within_limits(pos_snapshot):
+                    break
 
-            denom = max(1e-6, (MAX_SPREAD_ZSCORE - MIN_SPREAD_ZSCORE))
-            intensity = max(0.0, min(1.0, (abs_z - MIN_SPREAD_ZSCORE) / denom))
-            if intensity <= 0.0:
-                seenTicks.add(tick)
-                tick, status = get_tick_status()
-                continue
+                denom = max(1e-6, (MAX_SPREAD_ZSCORE - MIN_SPREAD_ZSCORE))
+                intensity = max(0.0, min(1.0, (abs_z - MIN_SPREAD_ZSCORE) / denom))
+                if intensity <= 0.0:
+                    continue
 
-            base_qty = int(round(intensity * MAX_TRADE_SIZE))
-            if base_qty <= 0:
-                seenTicks.add(tick)
-                tick, status = get_tick_status()
-                continue
+                base_qty = int(round(intensity * MAX_TRADE_SIZE))
+                if base_qty <= 0:
+                    continue
 
-            a, b = currSpread  # spread = divs[a] - divs[b]
-            beta_b = beta_map.get(b, 1.0)
-            beta_ratio = abs(beta_map.get(a, 1.0) / beta_b) if abs(beta_b) > 1e-6 else 1.0
-            hedge_qty = max(1, int(round(base_qty * beta_ratio)))
-            hedge_qty = min(hedge_qty, MAX_TRADE_SIZE)
+                a, b = pair  # spread = divs[a] - divs[b]
+                beta_b = beta_map.get(b, 1.0)
+                beta_ratio = abs(beta_map.get(a, 1.0) / beta_b) if abs(beta_b) > 1e-6 else 1.0
+                hedge_qty = max(1, int(round(base_qty * beta_ratio)))
+                hedge_qty = min(hedge_qty, MAX_TRADE_SIZE)
 
-            if currSpreadZScore > 0:
-                legs = ((a, "SELL", base_qty), (b, "BUY", hedge_qty))
-            else:
-                legs = ((a, "BUY", base_qty), (b, "SELL", hedge_qty))
+                if z_score > 0:
+                    legs = ((a, "SELL", base_qty), (b, "BUY", hedge_qty))
+                else:
+                    legs = ((a, "BUY", base_qty), (b, "SELL", hedge_qty))
 
-            if within_limits(pos_snapshot, price_map):
                 for tkr, action, qty in legs:
                     if place_mkt(tkr, action, qty):
-                        # refresh snapshot so risk checks stay current
-                        pos_snapshot = positions_map()
+                        delta = qty if action == "BUY" else -qty
+                        pos_snapshot[tkr] = pos_snapshot.get(tkr, 0) + delta
+                        spread_positions[pair][tkr] = spread_positions[pair].get(tkr, 0) + delta
 
-            # close positions on spreads close to 0 using actual positions
-            latest_positions = positions_map()
-            for (a, b), z_score in spread_z_map.items():
+                if not within_limits(pos_snapshot):
+                    break
+
+            # close positions on spreads close to 0 using tracked spread positions
+            for pair in SPREAD_PAIRS:
+                z_score = spread_z_map.get(pair)
+                if z_score is None:
+                    continue
                 if abs(z_score) < EXIT_SPREAD_ZSCORE:
-                    flatten_position_from_snapshot(a, latest_positions)
-                    flatten_position_from_snapshot(b, latest_positions)
+                    for tkr in pair:
+                        qty = spread_positions[pair].get(tkr, 0)
+                        if qty == 0:
+                            continue
+                        action = "SELL" if qty > 0 else "BUY"
+                        if place_mkt(tkr, action, abs(qty)):
+                            spread_positions[pair][tkr] = 0
             
             seenTicks.add(tick)
+            ticks_processed += 1
+            if ticks_processed % RECONCILE_TICK_INTERVAL == 0:
+                true_positions = positions_map()
+                reconcile_spread_positions(spread_positions, true_positions)
+                pos_snapshot = true_positions.copy()
             
         print(tick)
         
