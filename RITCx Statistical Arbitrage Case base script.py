@@ -46,9 +46,9 @@ SLEEP_SEC       = 0.25
 PRINT_HEARTBEAT = True
 
 
-MIN_SPREAD_ZSCORE = 2   #  (start trading here)
-MAX_SPREAD_ZSCORE = 3     # (full size here)
-EXIT_SPREAD_ZSCORE = 0.5  # (exit trades below this)
+MIN_SPREAD_ZSCORE        = 1.75   # start scaling in here
+MAX_SPREAD_ZSCORE        = 3.0    # full size here
+EXIT_SPREAD_ZSCORE       = 1.25    # flatten once |z| < 1.0
 TRANSACTION_COST_Z_BUFFER = 0.25  # minimum extra z to cover fees
 RECONCILE_TICK_INTERVAL = 10      # how often to sync spread vs real positions
 
@@ -416,6 +416,8 @@ def main():
     ticks_processed = 0
     spread_positions = {pair: {pair[0]: 0, pair[1]: 0} for pair in SPREAD_PAIRS}
 
+    maxGross  = maxNet = 0
+
     while status == "ACTIVE":
         if tick in seenTicks:
             tick, status = get_tick_status()
@@ -550,11 +552,10 @@ def main():
                 pos_snapshot = true_positions.copy()
 
 
-        maxGross = 0
         currGross = sum(abs(v) for v in positions_map().values())
         maxGross = max(currGross, maxGross)
 
-        maxNet = 0
+        
         currNet = abs(sum(v for v in positions_map().values()))
         maxNet = max(currNet, maxNet)
         
