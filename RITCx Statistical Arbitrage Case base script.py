@@ -36,8 +36,8 @@ NGN, WHEL, GEAR, RSM1000 = "NGN", "WHEL", "GEAR", "RSM1000"
 SPREAD_PAIRS = [(NGN, WHEL), (GEAR, NGN), (GEAR, WHEL)]
 
 FEE_MKT = 0.01          # $/share (market)
-ORDER_SIZE      = 5000
-MAX_TRADE_SIZE  = 10_000
+ORDER_SIZE      = 500
+MAX_TRADE_SIZE  = 1_000
 GROSS_LIMIT_SH  = 500_000
 NET_LIMIT_SH    = 100_000
 ENTRY_BAND_PCT = 0.6   # enter if |div| > 0.6%  (div > 0.6)
@@ -548,9 +548,24 @@ def main():
                 true_positions = positions_map()
                 reconcile_spread_positions(spread_positions, true_positions)
                 pos_snapshot = true_positions.copy()
-            
-        print(tick)
+
+
+        maxGross = 0
+        currGross = sum(abs(v) for v in positions_map().values())
+        maxGross = max(currGross, maxGross)
+
+        maxNet = 0
+        currNet = abs(sum(v for v in positions_map().values()))
+        maxNet = max(currNet, maxNet)
         
+        print(tick, within_limits(), positions_map())
+        print(spread_positions)
+        print("gross shares:", currGross)
+        print("maxGross:", maxGross)
+        print("net shares:", currNet)
+        print("maxNet:", maxNet)
+        print("---------------------------")
+
         """
         # trade per symbol (simple mean-reversion)
         def trade_on_div(tkr, div_pct):
