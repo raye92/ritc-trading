@@ -98,7 +98,8 @@ def place_mkt(ticker, action, qty):
                params={"ticker": ticker, "type": "MARKET",
                        "quantity": qty, "action": action})
     if PRINT_HEARTBEAT:
-        print(f"ORDER {action} {qty} {ticker} -> {'OK' if r.ok else 'FAIL'}")
+        status_text = f"OK (Status: {r.status_code})" if r.ok else f"FAIL (Status: {r.status_code}, Response: {r.text})"
+        print(f"ORDER {action} {qty} {ticker} -> {status_text}")
     return r.ok
 
 def within_limits():
@@ -392,6 +393,15 @@ def enter_beta_neutral_trade(tick: int, long_tkr: str, short_tkr: str,
     if not within_limits():
         print("[LIMIT] Cannot enter beta-neutral trade; limits reached.")
         return None
+    
+    # Check beta sign compatibility (same sign = positive ratio)
+    beta_long = beta_map.get(long_tkr, 0.0)
+    beta_short = beta_map.get(short_tkr, 0.0)
+    
+    if beta_long * beta_short <= 0:
+        print(f"[BETA SIGN] Skipping {long_tkr}/{short_tkr}: betas have opposite signs (β_long={beta_long:.4f}, β_short={beta_short:.4f})")
+        return None
+    
     qtys = calc_beta_neutral_shares(long_tkr, short_tkr, price_map, beta_map)
     if qtys is None:
         print("[SIZING] Unable to size beta-neutral trade.")
@@ -432,7 +442,7 @@ def enter_beta_neutral_trade(tick: int, long_tkr: str, short_tkr: str,
         print(f"[BETA ENTER] Long {long_tkr} ({long_qty}sh ${long_value:,.0f}) / "
               f"Short {short_tkr} ({short_qty}sh ${short_value:,.0f}) | Spread: {entry_spread:.2f}")
         return trade
-    print("[ORDER FAIL] Unable to enter beta-neutral trade.")
+    print(f"[ORDER FAIL] Unable to enter beta-neutral trade. Long order: {ok_long}, Short order: {ok_short}")
     if ok_long:
         place_mkt(long_tkr, "SELL", long_qty)
     if ok_short:
@@ -480,8 +490,33 @@ def exit_beta_neutral_trade(trade: BetaNeutralTrade, tick: int, price_map: Dict[
     # To exit, reverse the original side: if we originally BUY (long_side=+1), exit by SELL; if originally SELL, exit by BUY
     action_long = "SELL" if trade.long_side > 0 else "BUY"
     action_short = "SELL" if trade.short_side > 0 else "BUY"
-    ok_long = place_mkt(trade.long_ticker, action_long, trade.long_qty)
-    ok_short = place_mkt(trade.short_ticker, action_short, trade.short_qty)
+    
+    # Fixed order size of 5000 per order to avoid rate limiting
+    fixed_order_size = 10000
+    remaining_long = trade.long_qty
+    remaining_short = trade.short_qty
+    
+    ok_long = True
+    ok_short = True
+    
+    # Execute long exit in 5000-share orders
+    while remaining_long > 0:
+        qty_to_sell = min(fixed_order_size, remaining_long)
+        if not place_mkt(trade.long_ticker, action_long, qty_to_sell):
+            ok_long = False
+        remaining_long -= qty_to_sell
+        if remaining_long > 0:
+            sleep(0.05)  # Small delay between chunks
+    
+    # Execute short exit in 5000-share orders
+    while remaining_short > 0:
+        qty_to_sell = min(fixed_order_size, remaining_short)
+        if not place_mkt(trade.short_ticker, action_short, qty_to_sell):
+            ok_short = False
+        remaining_short -= qty_to_sell
+        if remaining_short > 0:
+            sleep(0.05)  # Small delay between chunks
+    
     pnl = trade.unrealized_pnl(price_map)
     trade.exit_tick = tick
     trade.status = "CLOSED"
@@ -490,7 +525,7 @@ def exit_beta_neutral_trade(trade: BetaNeutralTrade, tick: int, price_map: Dict[
     if ok_long and ok_short:
         print(f"[BETA EXIT] {reason} | {trade.long_ticker}/{trade.short_ticker} pnl={pnl:0.2f}")
     else:
-        print("[ORDER FAIL] exit order issue encountered.")
+        print(f"[ORDER FAIL] exit order issue encountered. Long order: {ok_long}, Short order: {ok_short}")
     return pnl
 
 
@@ -515,7 +550,7 @@ def init_live_plot(hist_ticks=None, hist_ngn=None, hist_whel=None, hist_gear=Non
     ax.set_xlabel("Tick")
     ax.set_ylabel("Divergence (%)")
     ax.grid(True)
-    ax.legend()
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     fig.canvas.draw()
     fig.canvas.flush_events()
     return fig, ax, line_ngn, line_whel, line_gear
@@ -530,24 +565,46 @@ def update_live_plot(ax, line_ngn, line_whel, line_gear, ticks, series_ngn, seri
     ax.autoscale_view()
     plt.pause(0.01)  # let GUI process events
 
-def init_spread_plot(hist_ticks=None, hist_spreads=None):
+def init_spread_plot(hist_ticks=None, hist_spreads=None, beta_map=None):
     plt.ion()
     fig, ax = plt.subplots()
-    # Plot historical spreads (every 5th point for spacing)
+    # Plot historical spreads (every 5th point for spacing) - only for pairs with same-sign betas
+    pair_configs = []
+    if beta_map:
+        # NGN-WHEL: only plot if both betas have same sign
+        if beta_map.get('NGN', 0) * beta_map.get('WHEL', 0) > 0:
+            pair_configs.append(('NGN-WHEL', 'purple'))
+        # NGN-GEAR: only plot if both betas have same sign
+        if beta_map.get('NGN', 0) * beta_map.get('GEAR', 0) > 0:
+            pair_configs.append(('NGN-GEAR', 'orange'))
+        # WHEL-GEAR: only plot if both betas have same sign
+        if beta_map.get('WHEL', 0) * beta_map.get('GEAR', 0) > 0:
+            pair_configs.append(('WHEL-GEAR', 'cyan'))
+    
     if hist_ticks is not None and hist_spreads is not None:
-        if 'NGN-WHEL' in hist_spreads:
-            ax.plot(hist_ticks[::5], hist_spreads['NGN-WHEL'][::5], '--', color='purple', alpha=0.3, linewidth=1.5,
-                    label="NGN-WHEL (Hist)")
-        if 'NGN-GEAR' in hist_spreads:
-            ax.plot(hist_ticks[::5], hist_spreads['NGN-GEAR'][::5], '--', color='orange', alpha=0.3, linewidth=1.5,
-                    label="NGN-GEAR (Hist)")
-        if 'WHEL-GEAR' in hist_spreads:
-            ax.plot(hist_ticks[::5], hist_spreads['WHEL-GEAR'][::5], '--', color='cyan', alpha=0.3, linewidth=1.5,
-                    label="WHEL-GEAR (Hist)")
-    # Create empty lines for live spreads
-    line_nw, = ax.plot([], [], color='purple', label="NGN-WHEL (Live)")
-    line_ng, = ax.plot([], [], color='orange', label="NGN-GEAR (Live)")
-    line_wg, = ax.plot([], [], color='cyan', label="WHEL-GEAR (Live)")
+        for pair_name, color in pair_configs:
+            if pair_name in hist_spreads:
+                ax.plot(hist_ticks[::5], hist_spreads[pair_name][::5], '--', color=color, alpha=0.3, linewidth=1.5,
+                        label=f"{pair_name} (Hist)")
+    # Create empty lines for live spreads (only for same-sign beta pairs)
+    lines_dict = {}
+    if not beta_map or beta_map.get('NGN', 0) * beta_map.get('WHEL', 0) > 0:
+        line_nw, = ax.plot([], [], color='purple', label="NGN-WHEL (Live)")
+        lines_dict['NGN-WHEL'] = line_nw
+    else:
+        lines_dict['NGN-WHEL'] = None
+    
+    if not beta_map or beta_map.get('NGN', 0) * beta_map.get('GEAR', 0) > 0:
+        line_ng, = ax.plot([], [], color='orange', label="NGN-GEAR (Live)")
+        lines_dict['NGN-GEAR'] = line_ng
+    else:
+        lines_dict['NGN-GEAR'] = None
+    
+    if not beta_map or beta_map.get('WHEL', 0) * beta_map.get('GEAR', 0) > 0:
+        line_wg, = ax.plot([], [], color='cyan', label="WHEL-GEAR (Live)")
+        lines_dict['WHEL-GEAR'] = line_wg
+    else:
+        lines_dict['WHEL-GEAR'] = None
     # Add horizontal lines for entry/exit thresholds
     ax.axhline(y=2.0, color='green', linestyle=':', alpha=0.5, label='Entry Threshold')
     ax.axhline(y=-2.0, color='green', linestyle=':', alpha=0.5)
@@ -558,15 +615,16 @@ def init_spread_plot(hist_ticks=None, hist_spreads=None):
     ax.set_xlabel("Tick")
     ax.set_ylabel("Z-Score Spread")
     ax.grid(True)
-    ax.legend()
+    ax.legend(loc='upper left')
     fig.canvas.draw()
     fig.canvas.flush_events()
-    return fig, ax, line_nw, line_ng, line_wg
+    return fig, ax, lines_dict
 
-def update_spread_plot(ax, line_nw, line_ng, line_wg, ticks, spread_nw, spread_ng, spread_wg):
-    line_nw.set_data(ticks, spread_nw)
-    line_ng.set_data(ticks, spread_ng)
-    line_wg.set_data(ticks, spread_wg)
+def update_spread_plot(ax, lines_dict, ticks, spreads_dict):
+    """Update spread plot lines. Only update lines that exist (valid pairs)."""
+    for pair_name, line in lines_dict.items():
+        if line is not None and pair_name in spreads_dict:
+            line.set_data(ticks, spreads_dict[pair_name])
     ax.relim()
     ax.autoscale_view()
     plt.pause(0.01)
@@ -640,21 +698,24 @@ def main():
     # Buffers for live spread plot
     ticks_spread = []
     spread_nw_list, spread_ng_list, spread_wg_list = [], [], []
+    spread_ng_list = []
 
     # Init dynamic plot with historical data and beta values in legend
     fig, ax, line_ngn, line_whel, line_gear = init_live_plot(
         hist_ticks, hist_ngn, hist_whel, hist_gear, beta_map)
 
     # Init spread plot
-    fig_spread, ax_spread, line_nw, line_ng, line_wg = init_spread_plot(
-        hist_ticks, hist_spreads)
+    fig_spread, ax_spread, lines_dict = init_spread_plot(
+        hist_ticks, hist_spreads, beta_map)
 
-    # Track active positions per pair (can have multiple trades per pair)
-    active_pair_positions: Dict[str, list] = {
-        'NGN-WHEL': [],
-        'NGN-GEAR': [],
-        'WHEL-GEAR': []
-    }
+    # Track active positions per pair (only for same-sign beta pairs)
+    active_pair_positions: Dict[str, list] = {}
+    if beta_map.get(NGN, 0) * beta_map.get(WHEL, 0) > 0:
+        active_pair_positions['NGN-WHEL'] = []
+    if beta_map.get(NGN, 0) * beta_map.get(GEAR, 0) > 0:
+        active_pair_positions['NGN-GEAR'] = []
+    if beta_map.get(WHEL, 0) * beta_map.get(GEAR, 0) > 0:
+        active_pair_positions['WHEL-GEAR'] = []
     trade_log = []
     signal_history = []
     realized_pnl_total = 0.0
@@ -715,30 +776,37 @@ def main():
                     denom = 1.0
                 z_map[ticker] = divergence_map[ticker] / denom
 
-            # Calculate and store z-score spreads
-            spread_nw = z_map.get(NGN, 0.0) - z_map.get(WHEL, 0.0)
-            spread_ng = z_map.get(NGN, 0.0) - z_map.get(GEAR, 0.0)
-            spread_wg = z_map.get(WHEL, 0.0) - z_map.get(GEAR, 0.0)
+            # Calculate and store z-score spreads (only for same-sign beta pairs)
+            spread_nw = z_map.get(NGN, 0.0) - z_map.get(WHEL, 0.0) if beta_map.get(NGN, 0) * beta_map.get(WHEL, 0) > 0 else None
+            spread_ng = z_map.get(NGN, 0.0) - z_map.get(GEAR, 0.0) if beta_map.get(NGN, 0) * beta_map.get(GEAR, 0) > 0 else None
+            spread_wg = z_map.get(WHEL, 0.0) - z_map.get(GEAR, 0.0) if beta_map.get(WHEL, 0) * beta_map.get(GEAR, 0) > 0 else None
            
             ticks_spread.append(tick)
             spread_nw_list.append(spread_nw)
             spread_ng_list.append(spread_ng)
             spread_wg_list.append(spread_wg)
-            update_spread_plot(ax_spread, line_nw, line_ng, line_wg,
-                             ticks_spread, spread_nw_list, spread_ng_list, spread_wg_list)
-
-            # Calculate spreads between all pairs
-            pair_spreads = {
-                'NGN-WHEL': z_map.get(NGN, 0.0) - z_map.get(WHEL, 0.0),
-                'NGN-GEAR': z_map.get(NGN, 0.0) - z_map.get(GEAR, 0.0),
-                'WHEL-GEAR': z_map.get(WHEL, 0.0) - z_map.get(GEAR, 0.0),
+            spreads_dict = {
+                'NGN-WHEL': spread_nw_list,
+                'NGN-GEAR': spread_ng_list,
+                'WHEL-GEAR': spread_wg_list,
             }
+            update_spread_plot(ax_spread, lines_dict,
+                             ticks_spread, spreads_dict)
+
+            # Calculate spreads between all pairs (only track same-sign beta pairs)
+            pair_spreads = {}
+            if beta_map.get(NGN, 0) * beta_map.get(WHEL, 0) > 0:
+                pair_spreads['NGN-WHEL'] = z_map.get(NGN, 0.0) - z_map.get(WHEL, 0.0)
+            if beta_map.get(NGN, 0) * beta_map.get(GEAR, 0) > 0:
+                pair_spreads['NGN-GEAR'] = z_map.get(NGN, 0.0) - z_map.get(GEAR, 0.0)
+            if beta_map.get(WHEL, 0) * beta_map.get(GEAR, 0) > 0:
+                pair_spreads['WHEL-GEAR'] = z_map.get(WHEL, 0.0) - z_map.get(GEAR, 0.0)
 
             signal_comment = "FLAT"
             unrealized = 0.0
             portfolio_beta_now = 0.0
 
-            if PRINT_HEARTBEAT and tick % 10 == 0:  # Print every 10 ticks
+            if PRINT_HEARTBEAT and tick % 3 == 0:
                 z_str = ", ".join([f"{t}:{z:.2f}" for t, z in z_map.items()])
                 spread_str = ", ".join([f"{pair}:{spread:.2f}" for pair, spread in pair_spreads.items()])
                 print(f"[TICK {tick}] Z-scores: {z_str}")
