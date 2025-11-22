@@ -6,10 +6,7 @@ All rights reserved.
 
 import requests
 from time import sleep
-import numpy as np
-import os
-from dotenv import load_dotenv
-load_dotenv()
+# minimal imports for 3-leg arb
 
 '''
 If you are not familiar with Python or feeling a little bit rusty, highly recommend you to go through the following link:
@@ -26,7 +23,7 @@ and maximize returns.
 '''
 
 API = "http://localhost:9999/v1"
-API_KEY = os.getenv("API_KEY", "Rotman")         # <-- your key
+API_KEY = "OR96FJU1"                     # <-- your key
 HDRS = {"X-API-key": API_KEY}          # change to X-API-Key if your server needs it
 
 # Tickers
@@ -50,11 +47,14 @@ ORDER_QTY     = 5000    # child order size for arb legs
 
 # Cushion to beat fees & slippage.
 # 3 legs with market orders => ~0.06 CAD/sh cost; add a bit more for safety.
-ARB_THRESHOLD_CAD = 0.07
+ARB_THRESHOLD_CAD = 0.12
 
 # --------- SESSION ----------
 s = requests.Session()
 s.headers.update(HDRS)
+
+# running count of active tender offers
+active_tender_count = 0
 
 # --------- HELPERS ----------
 def get_tick_status():
@@ -83,7 +83,7 @@ def positions_map():
         out.setdefault(k, 0)
     return out
 
-def place_mkt(ticker, action, qty): # type: LMT?
+def place_mkt(ticker, action, qty): # 
     # Sends Market orders; price param is ignored by most RIT cases when type=MARKET
     return s.post(f"{API}/orders",
                   params={"ticker": ticker, "type": "MARKET",
@@ -96,21 +96,161 @@ def within_limits():
     net   = pos[BULL] + pos[BEAR] + pos[RITC]  # simple net; refine as desired
     return (gross < MAX_GROSS) and (MAX_SHORT_NET < net < MAX_LONG_NET)
 
-def accept_active_tender_offers():
-    # Retrieve active tender offers from the RIT API, and accept the offer
-    r = s.get(f"{API}/tenders")  # replace with the correct endpoint
-    r.raise_for_status()
-    offers = r.json()
-        
-    if offers:
-        tender_id = offers[0]['tender_id']
-        price = offers[0]['price']
-        if offers[0]['is_fixed_bid']:
-            resp = s.post(f"{API}/tenders/{tender_id}")
-        else:
-            resp = s.post(f"{API}/tenders/{tender_id}", params={"price": price})
-        return print("Tender Offer Accepted:", resp.ok)
-    print("No active tenders")
+# --------- TENDER HELPERS & LOGIC ---------
+def get_active_tenders():
+    """Return list of active tenders from the simulator (empty list on error)."""
+    global active_tender_count
+    try:
+        r = s.get(f"{API}/tenders")
+        r.raise_for_status()
+        offers = r.json()
+        try:
+            active_tender_count = len(offers) if offers is not None else 0
+        except Exception:
+            active_tender_count = 0
+        return offers
+    except Exception:
+        active_tender_count = 0
+        return []
+
+
+def micro_edge_adjustment(edge, sigma=None, z_val=None):
+    """Conservative buffer to account for fees/slippage when evaluating an edge (CAD).
+    Returns adjusted edge = edge - buffer. Kept simple for the lightweight script.
+    """
+    base = FEE_MKT * 3.0
+    # small volatility / signal components (kept tiny here)
+    vol_buf = 0.0
+    z_buf = 0.0
+    try:
+        if sigma is not None:
+            vol_buf = 0.01 * abs(sigma)
+    except Exception:
+        vol_buf = 0.0
+    try:
+        if z_val is not None:
+            z_buf = 0.001 * abs(z_val)
+    except Exception:
+        z_buf = 0.0
+    buffer = base + vol_buf + z_buf
+    return edge - buffer
+
+
+def inventory_aware_qty(desired_qty, ticker=None):
+    """Lightweight inventory-aware sizing: keep desired qty within MAX_SIZE_EQUITY.
+    This is intentionally conservative; refine if you want more sophisticated sizing.
+    """
+    try:
+        q = int(desired_qty)
+        if q <= 0:
+            return 0
+        return min(q, MAX_SIZE_EQUITY)
+    except Exception:
+        return 0
+
+
+def unwind_after_tender(current_tick=None, max_qty=None):
+    """After accepting a tender, flatten residual positions in BULL, BEAR, RITC up to `max_qty`.
+    This sends simple market orders to neutralize exposures conservatively.
+    """
+    try:
+        if max_qty is None:
+            max_qty = ORDER_QTY
+        pos = positions_map()
+        actions = []
+        for tk in (BULL, BEAR, RITC):
+            p = int(pos.get(tk, 0))
+            if p == 0:
+                continue
+            if p > 0:
+                q = min(p, int(max_qty))
+                place_mkt(tk, "SELL", q)
+                actions.append((tk, "SELL", q))
+            else:
+                q = min(-p, int(max_qty))
+                place_mkt(tk, "BUY", q)
+                actions.append((tk, "BUY", q))
+        if actions:
+            print(f"Unwind after tender (tick={current_tick}): executed {actions}")
+        return True
+    except Exception as e:
+        print("Unwind after tender failed:", e)
+        return False
+
+
+def tender_relative_value(bull_bid, bull_ask, bear_bid, bear_ask, ritc_mid_cad, usd_mid, current_tick):
+    """Evaluate active tenders and accept only when profitable after conservative buffers.
+
+    Logic (conservative):
+      - For a tender that bids to BUY ETF (we can tender/share to them): if tender_price - NAV > buffer
+        we create/hedge by buying basket (BULL+BEAR) then accept the tender.
+      - For a tender that offers to SELL ETF to market (we can buy from them): if NAV - tender_price > buffer
+        we accept the tender (buy ETF) and hedge by selling the basket.
+
+    Returns True if any tender acted on.
+    """
+    offers = get_active_tenders()
+    if not offers:
+        return False
+    acted = False
+    # compute mid/basket values
+    bull_mid = 0.5 * (bull_bid + bull_ask) if (bull_bid and bull_ask) else None
+    bear_mid = 0.5 * (bear_bid + bear_ask) if (bear_bid and bear_ask) else None
+    if bull_mid is None or bear_mid is None or ritc_mid_cad is None:
+        return False
+    nav_mid = bull_mid + bear_mid
+
+    for off in offers:
+        try:
+            tender_id = off.get('tender_id') or off.get('id')
+            t_price = float(off.get('price', 0.0))
+            is_bid = off.get('is_fixed_bid', True)  # True => tender buys ETF from market
+            # If tender buys ETF from market (we can sell into it)
+            if is_bid:
+                diff = t_price - nav_mid
+                adj = micro_edge_adjustment(diff)
+                if adj > ARB_THRESHOLD_CAD and within_limits():
+                    q = inventory_aware_qty(ORDER_QTY, ticker=BULL)
+                    qb = q
+                    qs = q
+                    if qb > 0 and qs > 0:
+                        # Buy basket to create ETF equivalent
+                        place_mkt(BULL, "BUY", qb)
+                        place_mkt(BEAR, "BUY", qs)
+                        # Accept tender: POST to /tenders/{id}
+                        try:
+                            s.post(f"{API}/tenders/{tender_id}")
+                            print(f"Tender: accepted bid id={tender_id} price={t_price} nav={nav_mid:.4f} adj={adj:.4f}")
+                            # unwind any residual positions to remain delta-neutral
+                            unwind_after_tender(current_tick, max_qty=ORDER_QTY)
+                            acted = True
+                        except Exception:
+                            pass
+            else:
+                # tender is offering to sell ETF to market (we can buy)
+                diff = nav_mid - t_price
+                adj = micro_edge_adjustment(diff)
+                if adj > ARB_THRESHOLD_CAD and within_limits():
+                    q = inventory_aware_qty(ORDER_QTY, ticker=BULL)
+                    try:
+                        s.post(f"{API}/tenders/{tender_id}")
+                        # Hedge by selling the basket
+                        qb = inventory_aware_qty(q, ticker=BULL)
+                        qs = inventory_aware_qty(q, ticker=BEAR)
+                        if qb > 0 and qs > 0:
+                            place_mkt(BULL, "SELL", qb)
+                            place_mkt(BEAR, "SELL", qs)
+                        # unwind residuals to ensure neutral state
+                        unwind_after_tender(current_tick, max_qty=ORDER_QTY)
+                        print(f"Tender: accepted ask id={tender_id} price={t_price} nav={nav_mid:.4f} adj={adj:.4f}")
+                        acted = True
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    return acted
+
+# end tender helpers
 
 # --------- CORE LOGIC ----------
 def step_once():
@@ -136,7 +276,32 @@ def step_once():
     # SELL RITC (hit bid in USD), BUY basket (lift asks) -> compare in CAD
     edge2 = ritc_bid_cad - basket_buy_cost
     
-    accept_active_tender_offers() # Automatically checking and acceptting all of the tender offer
+    # tender-aware logic: poll active tenders and act if profitable (conservative)
+    try:
+        usd_mid = 0.5 * (usd_bid + usd_ask)
+        ritc_mid_cad = 0.5 * (ritc_bid_cad + ritc_ask_cad)
+        try:
+            cur_tick, _ = get_tick_status()
+        except Exception:
+            cur_tick = None
+        # refresh active tender count (get_active_tenders updates global)
+        try:
+            _ = get_active_tenders()
+        except Exception:
+            pass
+        acted_tender = tender_relative_value(bull_bid, bull_ask, bear_bid, bear_ask, ritc_mid_cad, usd_mid, cur_tick)
+        if acted_tender:
+            # tender handler executed hedging and/or accept; skip further arb decision this tick
+            return True, edge1, edge2, {
+                "bull_bid": bull_bid, "bull_ask": bull_ask,
+                "bear_bid": bear_bid, "bear_ask": bear_ask,
+                "ritc_bid_usd": ritc_bid_usd, "ritc_ask_usd": ritc_ask_usd,
+                "usd_bid": usd_bid, "usd_ask": usd_ask,
+                "ritc_bid_cad": ritc_bid_cad, "ritc_ask_cad": ritc_ask_cad,
+                "tender_count": active_tender_count
+            }
+    except Exception:
+        pass
 
     traded = False
     
@@ -161,7 +326,8 @@ def step_once():
         "bear_bid": bear_bid, "bear_ask": bear_ask,
         "ritc_bid_usd": ritc_bid_usd, "ritc_ask_usd": ritc_ask_usd,
         "usd_bid": usd_bid, "usd_ask": usd_ask,
-        "ritc_bid_cad": ritc_bid_cad, "ritc_ask_cad": ritc_ask_cad
+        "ritc_bid_cad": ritc_bid_cad, "ritc_ask_cad": ritc_ask_cad,
+        "tender_count": active_tender_count
     }
 
 def main():
@@ -169,7 +335,8 @@ def main():
     while status == "ACTIVE":
         traded, e1, e2, info = step_once()
         # Optional: print a lightweight heartbeat every 1s
-        print(f"tick={tick} e1={e1:.4f} e2={e2:.4f} ritc_ask_cad={info['ritc_ask_cad']:.4f}")
+        tender_ct = info.get('tender_count', 0) if isinstance(info, dict) else 0
+        print(f"tick={tick} e1={e1:.4f} e2={e2:.4f} ritc_ask_cad={info['ritc_ask_cad']:.4f} tenders={tender_ct}")
         sleep(0.5)
         tick, status = get_tick_status()
 
