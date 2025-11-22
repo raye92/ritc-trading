@@ -1,8 +1,7 @@
 """
 RIT Market Simluator Algorithmic Statistical Arbitrage Case — Basic Baseline Script
 Rotman International Trading Competition (RITC)
-Rotman BMO Finance Research and Trading Lab, Uniersity of Toronto (C)
-All rights reserved.
+
 """
 #%%
 import requests

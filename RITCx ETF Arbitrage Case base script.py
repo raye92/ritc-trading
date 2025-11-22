@@ -23,7 +23,7 @@ and maximize returns.
 '''
 
 API = "http://localhost:9999/v1"
-API_KEY = "OR96FJU1"                     # <-- your key
+API_KEY = "HL0MPJGJ"                     # <-- your key
 HDRS = {"X-API-key": API_KEY}          # change to X-API-Key if your server needs it
 
 # Tickers
@@ -43,7 +43,7 @@ MAX_SIZE_FX = 2500000  # per order for CAD/USD
 MAX_LONG_NET  = 25000
 MAX_SHORT_NET = -25000
 MAX_GROSS     = 500000
-ORDER_QTY     = 5000    # child order size for arb legs
+ORDER_QTY     = 1000    # child order size for arb legs
 
 # Cushion to beat fees & slippage.
 # 3 legs with market orders => ~0.06 CAD/sh cost; add a bit more for safety.
