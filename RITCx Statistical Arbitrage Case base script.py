@@ -1,9 +1,18 @@
+
 """
 RIT Market Simluator Algorithmic Statistical Arbitrage Case — Basic Baseline Script
 Rotman International Trading Competition (RITC)
 Rotman BMO Finance Research and Trading Lab, Uniersity of Toronto (C)
 All rights reserved.
 """
+#%%
+import requests
+from time import sleep
+import numpy as np
+import pandas as pd
+from bs4 import BeautifulSoup
+import math
+
 '''
 If you have any question about REST APIs and outputs of code please read:
     https://realpython.com/api-integration-in-python/#http-methods
@@ -40,8 +49,8 @@ ORDER_SIZE      = 5000
 MAX_TRADE_SIZE  = 10_000
 GROSS_LIMIT_SH  = 500_000
 NET_LIMIT_SH    = 100_000
-ENTRY_BAND_PCT  = 0.10   # enter if |div| > 0.50%
-EXIT_BAND_PCT   = 0.1   # flatten if |div| < 0.20%
+ENTRY_BAND_PCT  = 2   # enter if |div| > 0.50%
+EXIT_BAND_PCT   = 1.5   # flatten if |div| < 0.20%
 SLEEP_SEC       = 0.25
 PRINT_HEARTBEAT = True
 
@@ -82,6 +91,7 @@ def place_mkt(ticker, action, qty):
                        "quantity": qty, "action": action})
     if PRINT_HEARTBEAT:
         print(f"ORDER {action} {qty} {ticker} -> {'OK' if r.ok else 'FAIL'}")
+        print(r.text)
     return r.ok
 
 def within_limits():
@@ -139,32 +149,6 @@ def print_three_tables_and_betas(df_hist):
     print("\nHistorical Volatility and Beta:\n")
     print(vol_beta_df.to_string())
     return beta_map
-
-def calculate_betas(df_hist):
-    #Calculate beta map from dataframe
-    if len(df_hist) < 2:
-        return None
-    returns = df_hist[["RSM1000", "NGN", "WHEL", "GEAR"]].pct_change().dropna()
-    if len(returns) < 1:
-        return None
-    idx_var = returns["RSM1000"].var()
-    if idx_var == 0:
-        return None
-    beta_map = {t: float(np.cov(returns[t], returns["RSM1000"])[0,1] / idx_var)
-                for t in ["RSM1000","NGN","WHEL","GEAR"]}
-    return beta_map
-
-def add_tick_to_history(df_hist, tick, mid_idx, mid_ngn, mid_whe, mid_ger):
-    """Add new tick data to historical dataframe"""
-    new_row = pd.DataFrame({
-        "Tick": [tick],
-        "RSM1000": [mid_idx],
-        "NGN": [mid_ngn],
-        "WHEL": [mid_whe],
-        "GEAR": [mid_ger]
-    })
-    df_hist = pd.concat([df_hist, new_row], ignore_index=True)
-    return df_hist
 
 # ========= DYNAMIC PLOT (single figure, 3 lines) =========
 def init_live_plot(hist_ticks=None, hist_ngn=None, hist_whel=None, hist_gear=None, beta_map=None):
@@ -237,6 +221,9 @@ def update_price_plot(ax, line_ngn, line_whel, line_gear, line_idx, ticks, ngn, 
     ax.autoscale_view()
     plt.pause(0.01)
 
+
+
+
 # ========= MAIN =========
 def main():
     # Load historical once to get betas
@@ -287,8 +274,8 @@ def main():
 
     # Run while case active
     tick, status = get_tick_status()
-    while status == "ACTIVE":
 
+    while status == "ACTIVE":
         # current mids
         mid_idx = mid_price(RSM1000)
         mid_ngn = mid_price(NGN)
@@ -304,12 +291,6 @@ def main():
         # compute PTDs only if all bases/mids exist
         if None not in (base_idx, base_ngn, base_whe, base_ger,
                         mid_idx,  mid_ngn,  mid_whe,  mid_ger):
-            
-            # Add current tick to historical data and recalculate betas
-            df_hist = add_tick_to_history(df_hist, tick, mid_idx, mid_ngn, mid_whe, mid_ger)
-            updated_betas = calculate_betas(df_hist)
-            if updated_betas is not None:
-                beta_map = updated_betas
 
             ptd_idx = (mid_idx / base_idx) - 1.0
             ptd_ngn = (mid_ngn / base_ngn) - 1.0
@@ -349,9 +330,14 @@ def main():
                 elif abs(div_pct) < EXIT_BAND_PCT:
                     pos = positions_map().get(tkr, 0)
                     if pos > 0:
-                        place_mkt(tkr, "SELL", abs(pos))
+                        for i in range(math.ceil(pos / ORDER_SIZE)-1):
+                            place_mkt(tkr, "SELL", ORDER_SIZE)
+                        place_mkt(tkr, "SELL", pos % ORDER_SIZE)  
                     elif pos < 0:
-                        place_mkt(tkr, "BUY", abs(pos))
+                        for i in range(math.ceil(abs(pos) / ORDER_SIZE)-1):
+                            place_mkt(tkr, "BUY", ORDER_SIZE)
+                        place_mkt(tkr, "BUY", abs(pos) % ORDER_SIZE)
+                        
 
             trade_on_div(NGN,  div_ngn)
             trade_on_div(WHEL, div_whe)
@@ -360,9 +346,21 @@ def main():
         sleep(SLEEP_SEC)
         tick, status = get_tick_status()
 
+        print(sum([abs(p) for p in positions_map().values()]))
+
+
     # Keep the final chart on screen after loop ends
     plt.ioff()
     plt.show()
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
