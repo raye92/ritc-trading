@@ -23,7 +23,7 @@ and maximize returns.
 '''
 
 API = "http://localhost:9999/v1"
-API_KEY = "OR96FJU1"                     # <-- your key
+API_KEY = "Rotman"                     # <-- your key
 HDRS = {"X-API-key": API_KEY}          # change to X-API-Key if your server needs it
 
 # Tickers
@@ -46,8 +46,8 @@ MAX_GROSS     = 500000
 ORDER_QTY     = 5000    # child order size for arb legs
 
 # Cushion to beat fees & slippage.
-# 3 legs with market orders => ~0.06 CAD/sh cost; add a bit more for safety.
-ARB_THRESHOLD_CAD = 0.12
+
+ARB_THRESHOLD_CAD = 0.12       
 
 # --------- SESSION ----------
 s = requests.Session()
@@ -116,7 +116,7 @@ def get_active_tenders():
 
 def micro_edge_adjustment(edge, sigma=None, z_val=None):
     """Conservative buffer to account for fees/slippage when evaluating an edge (CAD).
-    Returns adjusted edge = edge - buffer. Kept simple for the lightweight script.
+    Returns adjusted edge = edge - buffer. 
     """
     base = FEE_MKT * 3.0
     # small volatility / signal components (kept tiny here)
@@ -137,9 +137,7 @@ def micro_edge_adjustment(edge, sigma=None, z_val=None):
 
 
 def inventory_aware_qty(desired_qty, ticker=None):
-    """Lightweight inventory-aware sizing: keep desired qty within MAX_SIZE_EQUITY.
-    This is intentionally conservative; refine if you want more sophisticated sizing.
-    """
+    """Lightweight inventory-aware sizing: keep desired qty within MAX_SIZE_EQUITY """
     try:
         q = int(desired_qty)
         if q <= 0:
@@ -181,7 +179,7 @@ def unwind_after_tender(current_tick=None, max_qty=None):
 def tender_relative_value(bull_bid, bull_ask, bear_bid, bear_ask, ritc_mid_cad, usd_mid, current_tick):
     """Evaluate active tenders and accept only when profitable after conservative buffers.
 
-    Logic (conservative):
+    Logic:
       - For a tender that bids to BUY ETF (we can tender/share to them): if tender_price - NAV > buffer
         we create/hedge by buying basket (BULL+BEAR) then accept the tender.
       - For a tender that offers to SELL ETF to market (we can buy from them): if NAV - tender_price > buffer
