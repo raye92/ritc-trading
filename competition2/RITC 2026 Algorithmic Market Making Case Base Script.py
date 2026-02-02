@@ -1,10 +1,18 @@
 """RITC 2026 Algorithmic Market Making Trading Case - REST API Basic Script"""
-
+import requests
+import numpy as np
+import pandas as pd
+from bs4 import BeautifulSoup
+from time import sleep
+import matplotlib.pyplot as plt
+import os
+from dotenv import load_dotenv
 import requests
 from time import sleep
 
 s = requests.Session()
-s.headers.update({'X-API-key': 'YOUR REST API CODE HERE'})
+APIKEY = os.getenv("API_KEY")
+s.headers.update({'X-API-key': APIKEY})
 
 #Sample setup
 MAX_EXPOSURE = 15000
