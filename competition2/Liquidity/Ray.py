@@ -12,7 +12,7 @@ s.headers.update({'X-API-key': os.getenv('API_KEY')})
 
 #Sample setup
 MAX_EXPOSURE = 15000
-ORDER_LIMIT = 500
+ORDER_LIMIT = 10000
 
 def get_tick():
     resp = s.get('http://localhost:9999/v1/case')
@@ -63,7 +63,7 @@ def get_position():
     resp = s.get ('http://localhost:9999/v1/securities')
     if resp.ok:
         book = resp.json()
-        return abs(book[0]['position']) + abs(book[1]['position']) + abs(book[2]['position']) + abs(book[3]['position'])
+        return abs(book[0]['position']) + abs(book[1]['position'])
 
 def get_open_orders(ticker):
     payload = {'ticker': ticker}
@@ -83,38 +83,51 @@ def get_order_status(order_id):
 def main():
     tick, status = get_tick()
     ticker_list = [i['ticker'] for i in s.get('http://localhost:9999/v1/securities').json()]
-
+    previous_ticker = -1
     while status == 'ACTIVE':     
-        
-        """closes all the positions at every 55 tick (in a minute) to avoid the position penalty"""   
-        if tick % 60 >= 55:
+        if previous_ticker != tick:
+            previous_ticker = tick
+            print(f"TICK NUMBER: {tick}")
             for ticker_symbol in ticker_list:
-                position = get_ind_position(ticker_symbol) 
-
+                position = int(get_ind_position(ticker_symbol))
+                print(f"Ticker symbol and position: {ticker_symbol}: {position}")
                 if position > 0:
+                    for i in range(position // ORDER_LIMIT):
+                        s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': 'SELL'})
+                        print(f"Sold {ORDER_LIMIT} shares of {ticker_symbol}")
+                        print(position)
+                        position -= ORDER_LIMIT
+                        print(position)
                     s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': position, 'action': 'SELL'})
                 elif position < 0:
+                    for i in range(abs(position) // ORDER_LIMIT):
+                        s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': 'BUY'})
+                        print(f"Bought {ORDER_LIMIT} shares of {ticker_symbol}")
+                        print(position)
+                        position += ORDER_LIMIT
+                        print(position)
                     s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': abs(position), 'action': 'BUY'})
 
-        for i in range(len(ticker_list)):
+        # for i in range(len(ticker_list)):
             
-            ticker_symbol = ticker_list[i]
-            position = get_position()
-            best_bid_price, best_ask_price = get_bid_ask(ticker_symbol)
+        #     ticker_symbol = ticker_list[i]
+        #     position = get_position()
+        #     best_bid_price, best_ask_price = get_bid_ask(ticker_symbol)
 
-            # Skip if book is empty
-            if best_bid_price is None or best_ask_price is None:
-                continue
+        #     # Skip if book is empty
+        #     if best_bid_price is None or best_ask_price is None:
+        #         continue
 
-            if position < MAX_EXPOSURE:
-                resp = s.post('http://localhost:9999/v1/orders', params = {'ticker': ticker_symbol, 'type': 'LIMIT', 'quantity': ORDER_LIMIT, 'price': best_bid_price, 'action': 'BUY'})
-                resp = s.post('http://localhost:9999/v1/orders', params = {'ticker': ticker_symbol, 'type': 'LIMIT', 'quantity': ORDER_LIMIT, 'price': best_ask_price, 'action': 'SELL'})
+        #     if position < MAX_EXPOSURE:
+        #         resp = s.post('http://localhost:9999/v1/orders', params = {'ticker': ticker_symbol, 'type': 'LIMIT', 'quantity': ORDER_LIMIT, 'price': best_bid_price, 'action': 'BUY'})
+        #         resp = s.post('http://localhost:9999/v1/orders', params = {'ticker': ticker_symbol, 'type': 'LIMIT', 'quantity': ORDER_LIMIT, 'price': best_ask_price, 'action': 'SELL'})
 
-            sleep(0.5) 
+        #     sleep(0.5) 
 
-            s.post('http://localhost:9999/v1/commands/cancel', params = {'ticker': ticker_symbol})
+        #     s.post('http://localhost:9999/v1/commands/cancel', params = {'ticker': ticker_symbol})
 
         tick, status = get_tick()
 
 if __name__ == '__main__':
+    print("Ray's script is running")
     main()
