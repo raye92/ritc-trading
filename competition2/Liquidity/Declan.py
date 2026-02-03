@@ -11,19 +11,28 @@ import requests
 from time import sleep
 
 s = requests.Session()
+load_dotenv()
 APIKEY = os.getenv("API_KEY")
 s.headers.update({'X-API-key': APIKEY})
+
 
 #Sample setup
 MAX_EXPOSURE = 15000
 ORDER_LIMIT = 500
-BASEURL ='http://localhost:9999/v1/case'
+MAX_TRADE_SIZE = 10_000
+PRINT_HEART_BEAT= True
+
+BASEURL ='http://localhost:9999/v1'
+
 
 def get_tick():
-    resp = s.get(BASEURL)
+    resp = s.get(BASEURL + '/case')
     if resp.ok:
         case = resp.json()
         return case['tick'], case['status']
+    else:
+        print(resp)
+    
 
 def get_bid_ask(ticker):
     payload = {'ticker': ticker}
@@ -70,6 +79,11 @@ def get_position():
         book = resp.json()
         return abs(book[0]['position']) + abs(book[1]['position']) 
 
+def get_book():
+    resp = s.get(BASEURL + '/securities')
+    if resp.ok:
+        return resp.json()
+
 def get_open_orders(ticker):
     payload = {'ticker': ticker}
     resp = s.get (BASEURL + '/orders', params = payload)
@@ -90,20 +104,98 @@ def get_tenders():
     if resp.ok:
         return resp.json()
     
-def flattenPosiitons():
-     resp = requests.post(BASEURL + '/tenders', params={"all": 1})
+def place_mkt(ticker, action, qty):
+    qty = int(max(1, min(qty, MAX_TRADE_SIZE)))
+    r = s.post(f"{BASEURL}/orders",
+               params={"ticker": ticker, "type": "MARKET",
+                       "quantity": qty, "action": action})
+    if PRINT_HEART_BEAT:
+        print(f"ORDER {action} {qty} {ticker} -> {'OK' if r.ok else 'FAIL'}")
+    return r.ok
 
+def acceptTender(tenderID):
+    r = s.post(f"{BASEURL}/tenders/{tenderID}", params= {"id": tenderID})
+    return r.ok
 
-    
-    
+def refuseTender(tenderID):
+    r = s.delete(f"{BASEURL}/tenders/{tenderID}", params= {"id": tenderID})
+    return r.ok
+
+def placeBid(tenderID, bid):
+    r = s.post(f"{BASEURL}/tenders/{tenderID}", params= {"id": tenderID, "price": bid})
+
+def flattenPositions(tick, ticker_list):
+    print(f"TICK NUMBER: {tick}")
+    for ticker_symbol in ticker_list:
+        position = int(get_ind_position(ticker_symbol))
+        print(f"Ticker symbol and position: {ticker_symbol}: {position}")
+        if position > 0:
+            for i in range(position // ORDER_LIMIT):
+                s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': 'SELL'})
+                print(f"Sold {ORDER_LIMIT} shares of {ticker_symbol}")
+                print(position)
+                position -= ORDER_LIMIT
+                print(position)
+            s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': position, 'action': 'SELL'})
+        elif position < 0:
+            for i in range(abs(position) // ORDER_LIMIT):
+                s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': 'BUY'})
+                print(f"Bought {ORDER_LIMIT} shares of {ticker_symbol}")
+                print(position)
+                position += ORDER_LIMIT
+                print(position)
+            s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': abs(position), 'action': 'BUY'})
 
 def main():
     tick, status = get_tick()
     ticker_list = [i['ticker'] for i in s.get(BASEURL+ '/securities').json()]
+    seenTenders = set()
 
-    while status == 'ACTIVE':     
-        
+    while status == 'ACTIVE':
+        # private offers
+        tenders = []
+        tmp = get_tenders()
+        for t in tmp:
+            if t["tender_id"] in seenTenders:
+                continue
+            else:
+                seenTenders.add(t["tender_id"])
+                tenders.append(t)
+        while tenders:
+            curr = tenders.pop()
+            caption = curr['caption'].split()
+            marketBid, marketAsk = get_bid_ask(curr['ticker'])
 
+            #case 1
+            if curr['is_fixed_bid'] == True:
+                if curr['action'] == 'SELL':
+                    if curr['price'] > marketBid:
+                        acceptTender(curr['tender_id'])
+                    else:
+                        refuseTender(curr['tender_id'])
+                elif curr['action'] == 'Buy':
+                    if curr['price'] < marketAsk:
+                        acceptTender(curr['tender_id'])
+                    else:
+                        refuseTender(curr['tender_id'])
+            #case 2
+            #elif caption[-1] == "filled.":
+                # figure out later
+            
+            #case 3
+            else:
+                if curr['action'] == 'SELL':
+                    b = marketBid + 0.10
+                    placeBid(curr['tender_id'], b)
+                elif curr['action'] == 'Buy':
+                    b = marketAsk - 0.10
+                    placeBid(curr['tender_id'], b)
+
+        previous_ticker = -1
+        if previous_ticker != tick:
+            previous_ticker = tick
+            flattenPositions(tick, ticker_list)
+                
         tick, status = get_tick()
 
 if __name__ == '__main__':
