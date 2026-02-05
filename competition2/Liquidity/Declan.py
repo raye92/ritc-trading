@@ -125,71 +125,82 @@ def placeBid(tenderID, bid):
     r = s.post(f"{BASEURL}/tenders/{tenderID}", params= {"id": tenderID, "price": bid})
 
 def flattenPositions(tick, ticker_list):
-    print(f"TICK NUMBER: {tick}")
+    #print(f"TICK NUMBER: {tick}")
     for ticker_symbol in ticker_list:
         position = int(get_ind_position(ticker_symbol))
-        print(f"Ticker symbol and position: {ticker_symbol}: {position}")
+        #print(f"Ticker symbol and position: {ticker_symbol}: {position}")
         if position > 0:
             for i in range(position // ORDER_LIMIT):
                 s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': 'SELL'})
-                print(f"Sold {ORDER_LIMIT} shares of {ticker_symbol}")
-                print(position)
+                #print(f"Sold {ORDER_LIMIT} shares of {ticker_symbol}")
+                #print(position)
                 position -= ORDER_LIMIT
-                print(position)
+                #print(position)
             s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': position, 'action': 'SELL'})
         elif position < 0:
             for i in range(abs(position) // ORDER_LIMIT):
                 s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': 'BUY'})
-                print(f"Bought {ORDER_LIMIT} shares of {ticker_symbol}")
-                print(position)
+                #print(f"Bought {ORDER_LIMIT} shares of {ticker_symbol}")
+                #print(position)
                 position += ORDER_LIMIT
-                print(position)
+                #print(position)
             s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': abs(position), 'action': 'BUY'})
-
+ 
 def main():
     tick, status = get_tick()
     ticker_list = [i['ticker'] for i in s.get(BASEURL+ '/securities').json()]
-    seenTenders = set()
-
+    securitiesList = {i['ticker']: i for i in s.get(BASEURL+ '/securities').json()}
+    # for tkr in ticker_list:
+    #     print(tkr, securitiesList[tkr]['trading_fee'])
+    usedTenders = set()
+    last = -1
     while status == 'ACTIVE':
-        # private offers
+        # set up tender list 
         tenders = []
         tmp = get_tenders()
         for t in tmp:
-            if t["tender_id"] in seenTenders:
+            if t["tender_id"] in usedTenders:
                 continue
             else:
-                seenTenders.add(t["tender_id"])
                 tenders.append(t)
-        while tenders:
-            curr = tenders.pop()
+        if len(tenders) != last:
+            print(len(tenders))
+            last = len(tenders)
+
+        # check for potential value 
+        for curr in tenders:
             caption = curr['caption'].split()
             marketBid, marketAsk = get_bid_ask(curr['ticker'])
 
             #case 1
             if curr['is_fixed_bid'] == True:
                 if curr['action'] == 'SELL':
-                    if curr['price'] > marketBid:
+                    if curr['price'] - securitiesList[curr['ticker']]['trading_fee'] > marketBid:
+                        print('placed case1')
                         acceptTender(curr['tender_id'])
-                    else:
-                        refuseTender(curr['tender_id'])
+                        usedTenders.add(curr['tender_id'])
                 elif curr['action'] == 'Buy':
-                    if curr['price'] < marketAsk:
+                    if curr['price'] + securitiesList[curr['ticker']]['trading_fee'] < marketAsk:
+                        print('placed case1')
                         acceptTender(curr['tender_id'])
-                    else:
-                        refuseTender(curr['tender_id'])
+                        usedTenders.add(curr['tender_id'])
             #case 2
             #elif caption[-1] == "filled.":
                 # figure out later
             
             #case 3
+            # curr['expires'] means the tick number on which the tender expires
             else:
-                if curr['action'] == 'SELL':
-                    b = marketBid + 0.10
+                if curr['action'] == 'SELL' and tick - curr['expires']< 3:
+                    print('placed case 3')
+                    b = marketBid + securitiesList[curr['ticker']]['trading_fee'] + 0.01
                     placeBid(curr['tender_id'], b)
-                elif curr['action'] == 'Buy':
-                    b = marketAsk - 0.10
+                    usedTenders.add(curr['tender_id'])
+                elif curr['action'] == 'Buy' and tick - curr['expires']< 3:
+                    print('placed case 3')
+                    b = marketAsk - securitiesList[curr['ticker']]['trading_fee'] - 0.01
                     placeBid(curr['tender_id'], b)
+                    usedTenders.add(curr['tender_id'])
 
         previous_ticker = -1
         if previous_ticker != tick:
