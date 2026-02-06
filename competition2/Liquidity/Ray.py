@@ -4,6 +4,7 @@ import requests
 from time import sleep
 import os
 from dotenv import load_dotenv
+import asyncio
 
 load_dotenv()
 
@@ -65,48 +66,74 @@ def get_position():
         book = resp.json()
         return abs(book[0]['position']) + abs(book[1]['position'])
 
-def get_open_orders(ticker):
-    payload = {'ticker': ticker}
-    resp = s.get ('http://localhost:9999/v1/orders', params = payload)
-    if resp.ok:
-        orders = resp.json()
-        buy_orders = [item for item in orders if item["action"] == "BUY"]
-        sell_orders = [item for item in orders if item["action"] == "SELL"]
-        return buy_orders, sell_orders
+def accept_tender(tender):
+    tender_id = tender['tender_id']
+    return s.post(f'http://localhost:9999/v1/tenders/{tender_id}')
 
-def get_order_status(order_id):
-    resp = s.get ('http://localhost:9999/v1/orders' + '/' + str(order_id))
-    if resp.ok:
-        order = resp.json()
-        return order['status']
+def lrg_mkt_order(ticker, action, quantity):
+    quantity = int(quantity)
+    print("LARGE MARKET ORDER", ticker, action, quantity)
+    for i in range(quantity // ORDER_LIMIT):
+        s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': action})
+        quantity -= ORDER_LIMIT
+    s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': quantity, 'action': action})
 
-def main():
+def flatten_positions(ticker_list):
+    for ticker_symbol in ticker_list:
+        position = int(get_ind_position(ticker_symbol))
+        if position > 0:
+            lrg_mkt_order(ticker_symbol, 'SELL', position)
+        elif position < 0:
+            lrg_mkt_order(ticker_symbol, 'BUY', abs(position))
+
+async def place_bid(tender, tick):
+    market_bid, market_ask = get_bid_ask(tender['ticker'])
+    previous_tick = -1
+    current_tick = tick
+    print("PLACED BID CALLED, tick:", market_bid, market_ask, "tender action:", tender['action'], "tender price:", tender['price'])
+    while current_tick <= tender['expires']:
+        if previous_tick == current_tick:
+            await asyncio.sleep(0)
+            continue
+        print(previous_tick, current_tick)
+        previous_tick = current_tick
+        current_tick, _ = get_tick()
+        print("PLACED BID LOOP", current_tick, tender['expires'])
+        print(previous_tick, current_tick)
+        market_bid, market_ask = get_bid_ask(tender['ticker'])
+        if market_bid is None or market_ask is None:
+            await asyncio.sleep(0)
+            continue
+        if tender['action'] == 'SELL' and tender['price'] > market_bid:
+            print("WE WANT TO SELL")
+            accept_tender(tender)
+        elif tender['action'] == 'BUY' and tender['price'] < market_ask:
+            print("WE WANT TO BUY")
+            accept_tender(tender)
+        await asyncio.sleep(0)
+
+async def main():
     tick, status = get_tick()
     ticker_list = [i['ticker'] for i in s.get('http://localhost:9999/v1/securities').json()]
-    previous_ticker = -1
-    while status == 'ACTIVE':     
-        if previous_ticker != tick:
-            previous_ticker = tick
-            print(f"TICK NUMBER: {tick}")
-            for ticker_symbol in ticker_list:
-                position = int(get_ind_position(ticker_symbol))
-                print(f"Ticker symbol and position: {ticker_symbol}: {position}")
-                if position > 0:
-                    for i in range(position // ORDER_LIMIT):
-                        s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': 'SELL'})
-                        print(f"Sold {ORDER_LIMIT} shares of {ticker_symbol}")
-                        print(position)
-                        position -= ORDER_LIMIT
-                        print(position)
-                    s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': position, 'action': 'SELL'})
-                elif position < 0:
-                    for i in range(abs(position) // ORDER_LIMIT):
-                        s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': 'BUY'})
-                        print(f"Bought {ORDER_LIMIT} shares of {ticker_symbol}")
-                        print(position)
-                        position += ORDER_LIMIT
-                        print(position)
-                    s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': abs(position), 'action': 'BUY'})
+    previous_tick = -1
+    q = set()
+    
+    while status == 'ACTIVE':
+        if previous_tick != tick:
+            print("WHILE LOOP TICK:", previous_tick, tick)
+            previous_tick = tick
+            resp = s.get('http://localhost:9999/v1/tenders')
+            if resp.ok:
+                tenders = resp.json()
+                for tender in tenders:
+                    if (tender['tender_id'], tender['expires']) not in q and tender['is_fixed_bid'] == True:
+                        asyncio.create_task(place_bid(tender, tick))
+                        q.add((tender['tender_id'], tender['expires']))
+
+            flatten_positions(ticker_list)
+        await asyncio.sleep(0)
+        # Flattens positions at every tick
+        
 
         # for i in range(len(ticker_list)):
             
@@ -130,4 +157,4 @@ def main():
 
 if __name__ == '__main__':
     print("Ray's script is running")
-    main()
+    asyncio.run(main())
