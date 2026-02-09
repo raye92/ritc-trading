@@ -124,51 +124,30 @@ def refuseTender(tenderID):
 def placeBid(tenderID, bid):
     r = s.post(f"{BASEURL}/tenders/{tenderID}", params= {"id": tenderID, "price": bid})
 
-def lrg_mkt_order(ticker, action, quantity, price):
+def lrg_mkt_order(ticker, action, quantity):
     quantity = int(quantity)
-    tmp = quantity
     #print("LARGE MARKET ORDER", ticker, action, quantity)
-    if price is not None:
-        attempts = 0
-        while quantity > 0 and attempts < 100 * (quantity // ORDER_LIMIT):
-            amt = min(quantity , ORDER_LIMIT)
-            resp = s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': amt, 'action': action, 'price': price})
-            if resp:
-                quantity  -= resp.json()['quantity_filled']
-            attempts += 1
-        print("sold ", (tmp - quantity) / tmp ,"% at desired price ", quantity, int(get_ind_position(ticker)), " remaining")
-    else:
-        print(" no desried price")
-    for i in range(int(quantity) // ORDER_LIMIT):
+    for i in range(quantity // ORDER_LIMIT):
         s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': action})
         quantity -= ORDER_LIMIT
     s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': quantity, 'action': action})
-    print(int(get_ind_position(ticker)))
 
-def flatten_positions(ticker_map):
-    # while loop to wait to make sure we're selling at desired price when we want to
-    for tkr, price in ticker_map.items():
-        if price != None:
-            while( int(get_ind_position(tkr)) == 0):
-                wait = 1
-        position = int(get_ind_position(tkr))
+def flatten_positions(ticker_list):
+    for ticker_symbol in ticker_list:
+        position = int(get_ind_position(ticker_symbol))
         if position > 0:
-            lrg_mkt_order(tkr, 'SELL', position, price)
+            lrg_mkt_order(ticker_symbol, 'SELL', position)
         elif position < 0:
-            lrg_mkt_order(tkr, 'BUY', abs(position), price)
+            lrg_mkt_order(ticker_symbol, 'BUY', abs(position))
 
 def main():
     tick, status = get_tick()
     ticker_list = [i['ticker'] for i in s.get(BASEURL+ '/securities').json()]
     securities = {i['ticker']: i for i in s.get(BASEURL+ '/securities').json()}
-    desiredPrices = {i : None for i in ticker_list}
-    usedTenders = set()
-
-    # set up buffer amts
-    securities['RITC']['buffer'] = 0.04 # -> low volititlity
-    securities['COMP']['buffer'] = 0.14 # -> high volitiility
+    securities['RITC']['buffer'] = 0.04 # - > low volitilty
+    securities['COMP']['buffer'] = 0.14 # -> high volititility 
     
-   
+    usedTenders = set()
     previous_tick = -1
     last = -1
     while status == 'ACTIVE':
@@ -188,6 +167,7 @@ def main():
             # check for potential value 
             for curr in tenders:
                 caption = curr['caption'].split()
+                #print(caption)
                 marketBid, marketAsk = get_bid_ask(curr['ticker'])
 
                 #case 1
@@ -197,28 +177,25 @@ def main():
                             print('placed case1, tick', tick)
                             acceptTender(curr['tender_id'])
                             usedTenders.add(curr['tender_id'])
-                            desiredPrices[curr['ticker']] = curr['price']
                     elif curr['action'] == 'BUY':
                         if curr['price'] + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] < marketAsk:
                             print('placed case1, tick', tick)
                             acceptTender(curr['tender_id'])
                             usedTenders.add(curr['tender_id'])
-                            desiredPrices[curr['ticker']] = curr['price']
                 #case 2
+                
                 elif caption[-1] == 'filled.':
                     if curr['action'] == 'SELL':
                         print('placed case 2, tick', tick)
                         b = marketBid + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer']
                         placeBid(curr['tender_id'], b)
-                        desiredPrices[curr['ticker']] = b
                         usedTenders.add(curr['tender_id'])
-                        
                     elif curr['action'] == 'BUY':
                         print('placed case 2, tick', tick)
                         b = marketAsk - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer']
                         placeBid(curr['tender_id'], b)
-                        desiredPrices[curr['ticker']] = b
                         usedTenders.add(curr['tender_id'])
+                
                 #case 3
                 # curr['expires'] means the tick number on which the tender expires
                 else:
@@ -226,18 +203,15 @@ def main():
                         print('placed case 3, tick', tick)
                         b = marketBid + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer']
                         placeBid(curr['tender_id'], b)
-                        desiredPrices[curr['ticker']] = b
                         usedTenders.add(curr['tender_id'])
                     elif curr['action'] == 'BUY' and curr['expires'] - tick  < 5  :
                         print('placed case 3, tick', tick)
                         b = marketAsk - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer'] 
                         placeBid(curr['tender_id'], b)
-                        desiredPrices[curr['ticker']] = b
                         usedTenders.add(curr['tender_id'])
 
             previous_tick = tick
-            flatten_positions(desiredPrices)
-            desiredPrices = {i : None for i in ticker_list}
+            flatten_positions(ticker_list)
                     
         tick, status = get_tick()
 
