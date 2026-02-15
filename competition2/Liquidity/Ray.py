@@ -14,6 +14,69 @@ s.headers.update({'X-API-key': os.getenv('API_KEY')})
 #Sample setup
 MAX_EXPOSURE = 15000
 ORDER_LIMIT = 10000
+commissions = {
+    "RITC": 0.02, 
+    "COMP": 0.02, 
+    "TRNT": 0.01, 
+    "MTRL": 0.01, 
+    "BLU": 0.04, 
+    "RED": 0.03, 
+    "GRN": 0.02, 
+    "WDY": 0.02, 
+    "BZZ": 0.02, 
+    "BNN": 0.03, 
+    "VNS": 0.02, 
+    "MRS": 0.02, 
+    "JPTR": 0.02, 
+    "STRN": 0.02
+}
+
+volatility = {
+"RITC": "Low",
+"COMP": "Medium",
+"TRNT": "High",
+"MTRL": "Low",
+"BLU":  "High",
+"RED":  "Low",
+"GRN":  "Medium",
+"WDY":  "Medium",
+"BZZ":  "High",
+"BNN":  "Medium",
+"VNS":  "High",
+"MRS":  "Medium",
+"JPTR": "Low",
+"STRN": "High"
+}
+
+liquidity = {
+    "RITC": "Medium",
+    "COMP": "High",
+    "TRNT": "Medium",
+    "MTRL": "Low",
+    "BLU":  "High",
+    "RED":  "Medium",
+    "GRN":  "Medium",
+    "WDY":  "High",
+    "BZZ":  "Medium",
+    "BNN":  "Medium",
+    "VNS":  "Medium",
+    "MRS":  "High",
+    "JPTR": "Medium",
+    "STRN": "Medium"
+}
+
+volatility_evs = {
+    "Low": 0.00,
+    "Medium": 0.08,
+    "High": 0.25
+}
+
+liquidity_evs = {
+    "Low": 0.05,
+    "Medium": 0.03,
+    "High": 0.00
+}
+
 
 def get_tick():
     resp = s.get('http://localhost:9999/v1/case')
@@ -72,7 +135,8 @@ def accept_tender(tender):
 
 def lrg_mkt_order(ticker, action, quantity):
     quantity = int(quantity)
-    print("LARGE MARKET ORDER", ticker, action, quantity)
+    market_bid, market_ask = get_bid_ask(ticker)
+    print("LARGE MARKET ORDER", ticker, action, quantity, market_bid, market_ask)
     for i in range(quantity // ORDER_LIMIT):
         s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': action})
         quantity -= ORDER_LIMIT
@@ -86,31 +150,45 @@ def flatten_positions(ticker_list):
         elif position < 0:
             lrg_mkt_order(ticker_symbol, 'BUY', abs(position))
 
-async def place_bid(tender, tick):
+async def place_bid(tender, tick, cost):
     market_bid, market_ask = get_bid_ask(tender['ticker'])
     previous_tick = -1
     current_tick = tick
-    print("PLACED BID CALLED, tick:", market_bid, market_ask, "tender action:", tender['action'], "tender price:", tender['price'])
     while current_tick <= tender['expires']:
         if previous_tick == current_tick:
             await asyncio.sleep(0)
             continue
-        print(previous_tick, current_tick)
         previous_tick = current_tick
         current_tick, _ = get_tick()
-        print("PLACED BID LOOP", current_tick, tender['expires'])
-        print(previous_tick, current_tick)
         market_bid, market_ask = get_bid_ask(tender['ticker'])
-        if market_bid is None or market_ask is None:
-            await asyncio.sleep(0)
-            continue
-        if tender['action'] == 'SELL' and tender['price'] > market_bid:
-            print("WE WANT TO SELL")
+        print(tender['action'], tender['price'], market_bid, market_ask, cost)
+        diff = 0
+        if tender['action'] == 'SELL':
+            diff = tender['price'] - market_ask
+        elif tender['action'] == 'BUY':
+            diff = market_bid - tender['price']
+        print("DIFF:", diff, "COSTS:", cost)
+        if diff >  cost:
+            print("WE WANT TO", tender['action'], "AT", tender['price'])
             accept_tender(tender)
-        elif tender['action'] == 'BUY' and tender['price'] < market_ask:
-            print("WE WANT TO BUY")
-            accept_tender(tender)
+        else:
+            print("WE DON'T WANT TO DO ANYTHING")
         await asyncio.sleep(0)
+
+async def place_tender(tender, cost):
+    current_tick, _ = get_tick()
+    while current_tick < tender['expires'] - 1:
+        current_tick, _ = get_tick()
+        await asyncio.sleep(0)
+
+    market_bid, market_ask = get_bid_ask(tender['ticker'])
+
+    if tender['action'] == 'SELL':
+        price = market_ask + cost
+    elif tender['action'] == 'BUY':
+        price = market_bid - cost
+    print("PRICE:", price, "Tick:", current_tick)
+    s.post(f'http://localhost:9999/v1/tenders/{tender["tender_id"]}', params={'price': price})
 
 async def main():
     tick, status = get_tick()
@@ -120,14 +198,21 @@ async def main():
     
     while status == 'ACTIVE':
         if previous_tick != tick:
-            print("WHILE LOOP TICK:", previous_tick, tick)
             previous_tick = tick
             resp = s.get('http://localhost:9999/v1/tenders')
             if resp.ok:
                 tenders = resp.json()
                 for tender in tenders:
+                    cost = commissions[tender['ticker']] + liquidity_evs[liquidity[tender['ticker']]] + volatility_evs[volatility[tender['ticker']]]
                     if (tender['tender_id'], tender['expires']) not in q and tender['is_fixed_bid'] == True:
-                        asyncio.create_task(place_bid(tender, tick))
+                        print("CASE 1")
+                        print(tender)
+                        asyncio.create_task(place_bid(tender, tick, cost))
+                        q.add((tender['tender_id'], tender['expires']))
+                    elif (tender['tender_id'], tender['expires']) not in q and tender['is_fixed_bid'] == False:
+                        print("CASE 2/3")
+                        print(tender)
+                        asyncio.create_task(place_tender(tender, cost))
                         q.add((tender['tender_id'], tender['expires']))
 
             flatten_positions(ticker_list)
