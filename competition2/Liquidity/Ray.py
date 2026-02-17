@@ -11,8 +11,8 @@ load_dotenv()
 s = requests.Session()
 s.headers.update({'X-API-key': os.getenv('API_KEY')})
 
+
 #Sample setup
-MAX_EXPOSURE = 15000
 ORDER_LIMIT = 10000
 commissions = {
     "RITC": 0.02, 
@@ -67,8 +67,8 @@ liquidity = {
 
 volatility_evs = {
     "Low": 0.00,
-    "Medium": 0.08,
-    "High": 0.25
+    "Medium": 0.14,
+    "High": 0.30
 }
 
 liquidity_evs = {
@@ -143,8 +143,18 @@ def lrg_mkt_order(ticker, action, quantity):
     s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': quantity, 'action': action})
 
 def flatten_positions(ticker_list):
+    
     for ticker_symbol in ticker_list:
+        if liquidity[ticker_symbol] == 'Low' or ticker_symbol == 'COMP' or ticker_symbol == 'RITC':
+            MAX_EXIT_EXPOSURE = 2000
+        elif liquidity[ticker_symbol] == 'Medium':
+            MAX_EXIT_EXPOSURE = 50000
+        elif liquidity[ticker_symbol] == 'High':
+            MAX_EXIT_EXPOSURE = 100000
+            
         position = int(get_ind_position(ticker_symbol))
+        if abs(position) > MAX_EXIT_EXPOSURE:
+            position = MAX_EXIT_EXPOSURE if position > 0 else -MAX_EXIT_EXPOSURE
         if position > 0:
             lrg_mkt_order(ticker_symbol, 'SELL', position)
         elif position < 0:
@@ -155,24 +165,26 @@ async def place_bid(tender, tick, cost):
     previous_tick = -1
     current_tick = tick
     while current_tick <= tender['expires']:
+        current_tick, _ = get_tick()
         if previous_tick == current_tick:
             await asyncio.sleep(0)
             continue
         previous_tick = current_tick
-        current_tick, _ = get_tick()
         market_bid, market_ask = get_bid_ask(tender['ticker'])
-        print(tender['action'], tender['price'], market_bid, market_ask, cost)
         diff = 0
+        
         if tender['action'] == 'SELL':
             diff = tender['price'] - market_ask
         elif tender['action'] == 'BUY':
             diff = market_bid - tender['price']
-        print("DIFF:", diff, "COSTS:", cost)
-        if diff >  cost:
+    
+        if diff > cost:
+            print(tender['action'], tender['price'], market_bid, market_ask, cost)
+            print("DIFF:", diff, "COSTS:", cost)
             print("WE WANT TO", tender['action'], "AT", tender['price'])
             accept_tender(tender)
-        else:
-            print("WE DON'T WANT TO DO ANYTHING")
+            break
+        
         await asyncio.sleep(0)
 
 async def place_tender(tender, cost):
@@ -188,6 +200,8 @@ async def place_tender(tender, cost):
     elif tender['action'] == 'BUY':
         price = market_bid - cost
     print("PRICE:", price, "Tick:", current_tick)
+    amount = tender.get('quantity', tender.get('amount', ''))
+    print(f"{current_tick},{tender['ticker']},{tender['action']},{amount},{market_bid},{market_ask}")
     s.post(f'http://localhost:9999/v1/tenders/{tender["tender_id"]}', params={'price': price})
 
 async def main():
@@ -205,41 +219,20 @@ async def main():
                 for tender in tenders:
                     cost = commissions[tender['ticker']] + liquidity_evs[liquidity[tender['ticker']]] + volatility_evs[volatility[tender['ticker']]]
                     if (tender['tender_id'], tender['expires']) not in q and tender['is_fixed_bid'] == True:
-                        print("CASE 1")
+                        print("\nCASE 1")
                         print(tender)
                         asyncio.create_task(place_bid(tender, tick, cost))
                         q.add((tender['tender_id'], tender['expires']))
                     elif (tender['tender_id'], tender['expires']) not in q and tender['is_fixed_bid'] == False:
-                        print("CASE 2/3")
+                        print("\nCASE 2/3")
                         print(tender)
                         asyncio.create_task(place_tender(tender, cost))
                         q.add((tender['tender_id'], tender['expires']))
 
             flatten_positions(ticker_list)
         await asyncio.sleep(0)
-        # Flattens positions at every tick
-        
-
-        # for i in range(len(ticker_list)):
-            
-        #     ticker_symbol = ticker_list[i]
-        #     position = get_position()
-        #     best_bid_price, best_ask_price = get_bid_ask(ticker_symbol)
-
-        #     # Skip if book is empty
-        #     if best_bid_price is None or best_ask_price is None:
-        #         continue
-
-        #     if position < MAX_EXPOSURE:
-        #         resp = s.post('http://localhost:9999/v1/orders', params = {'ticker': ticker_symbol, 'type': 'LIMIT', 'quantity': ORDER_LIMIT, 'price': best_bid_price, 'action': 'BUY'})
-        #         resp = s.post('http://localhost:9999/v1/orders', params = {'ticker': ticker_symbol, 'type': 'LIMIT', 'quantity': ORDER_LIMIT, 'price': best_ask_price, 'action': 'SELL'})
-
-        #     sleep(0.5) 
-
-        #     s.post('http://localhost:9999/v1/commands/cancel', params = {'ticker': ticker_symbol})
 
         tick, status = get_tick()
 
 if __name__ == '__main__':
-    print("Ray's script is running")
     asyncio.run(main())
