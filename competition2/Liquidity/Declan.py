@@ -16,11 +16,18 @@ APIKEY = os.getenv("API_KEY")
 s.headers.update({'X-API-key': APIKEY})
 
 
-#Sample setup
 MAX_EXPOSURE = 15000
 ORDER_LIMIT = 10_000
 MAX_TRADE_SIZE = 10_000
 PRINT_HEART_BEAT= True
+
+LOW_VOL_BUFFER  = 0.04    # -> low volatility
+MED_VOL_BUFFER  = 0.14    # -> medium volatility
+HIGH_VOL_BUFFER = 0.50    # -> high volatility
+
+LOW_LIQ   = 2_000         # -> low liquidity
+MED_LIQ   = 10_000        # -> medium liquidity
+HIGH_LIQ  = 1_000_000       # -> high liquidity
 
 BASEURL ='http://localhost:9999/v1'
 
@@ -133,21 +140,60 @@ def lrg_mkt_order(ticker, action, quantity):
     if quantity != 0:
         s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': quantity, 'action': action})
 
-def flatten_positions(ticker_list):
-    for ticker_symbol in ticker_list:
+def flatten_positions(securities):
+    for ticker_symbol, values in securities.items():
         position = int(get_ind_position(ticker_symbol))
         if position > 0:
-            lrg_mkt_order(ticker_symbol, 'SELL', position)
+            lrg_mkt_order(ticker_symbol, 'SELL', min(values['liquidity'], position))
         elif position < 0:
-            lrg_mkt_order(ticker_symbol, 'BUY', abs(position))
+            lrg_mkt_order(ticker_symbol, 'BUY', min(values['liquidity'], abs(position)))
+
+def setupSecurities():
+    securities = {i['ticker']: i for i in s.get(BASEURL+ '/securities').json()}
+
+    # SUB-HEAT 1
+    securities['RITC']['buffer'] = LOW_VOL_BUFFER
+    securities['RITC']['liquidity'] = MED_LIQ
+    securities['COMP']['buffer'] = MED_VOL_BUFFER
+    securities['COMP']['liquidity'] = HIGH_LIQ
+
+    # SUB-HEAT 2
+    securities['TRNT']['buffer'] = HIGH_VOL_BUFFER
+    securities['TRNT']['liquidity'] = MED_LIQ  
+    securities['MTRL']['buffer'] = LOW_VOL_BUFFER
+    securities['MTRL']['liquidity'] = LOW_LIQ
+    
+    # SUB-HEAT 3
+    securities['BLU']['buffer'] = HIGH_VOL_BUFFER
+    securities['BLU']['liquidity'] = HIGH_LIQ      
+    securities['RED']['buffer'] = LOW_VOL_BUFFER
+    securities['RED']['liquidity'] = MED_LIQ          
+    securities['GRN']['buffer'] = MED_VOL_BUFFER
+    securities['GRN']['liquidity'] = MED_LIQ      
+
+    # SUB-HEAT 4
+    securities['WDY']['buffer'] = MED_VOL_BUFFER
+    securities['WDY']['liquidity'] = HIGH_LIQ      
+    securities['BZZ']['buffer'] = HIGH_VOL_BUFFER
+    securities['BZZ']['liquidity'] = MED_LIQ     
+    securities['BNN']['buffer'] = MED_VOL_BUFFER
+    securities['BNN']['liquidity'] = MED_LIQ  
+
+    # SUB-HEAT 5
+    securities['VNS']['buffer'] = HIGH_VOL_BUFFER
+    securities['VNS']['liquidity'] = MED_LIQ     
+    securities['MRS']['buffer'] = MED_VOL_BUFFER
+    securities['MRS']['liquidity'] = HIGH_LIQ 
+    securities['JPTR']['buffer'] = LOW_VOL_BUFFER
+    securities['JPTR']['liquidity'] = MED_LIQ
+    securities['STRN']['buffer'] = HIGH_VOL_BUFFER
+    securities['STRN']['liquidity'] = MED_LIQ    
+    return securities
 
 def main():
     tick, status = get_tick()
-    ticker_list = [i['ticker'] for i in s.get(BASEURL+ '/securities').json()]
-    securities = {i['ticker']: i for i in s.get(BASEURL+ '/securities').json()}
-    securities['RITC']['buffer'] = 0.04 # - > low volitilty
-    securities['COMP']['buffer'] = 0.14 # -> high volititility 
-    
+    securities = setupSecurities()
+
     usedTenders = set()
     previous_tick = -1
     last = -1
@@ -175,25 +221,25 @@ def main():
                 if curr['is_fixed_bid'] == True:
                     if curr['action'] == 'SELL':
                         if curr['price'] - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer'] > marketAsk:
-                            print('placed case1, tick', tick)
+                            print('placed case1, tick', tick, curr['ticker'])
                             acceptTender(curr['tender_id'])
                             usedTenders.add(curr['tender_id'])
                     elif curr['action'] == 'BUY':
                         if curr['price'] + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] < marketBid:
-                            print('placed case1, tick', tick)
+                            print('placed case1, tick', tick, curr['ticker'])
                             acceptTender(curr['tender_id'])
                             usedTenders.add(curr['tender_id'])
                 #case 2
                 elif caption[-1] == 'filled.' and curr['expires'] - tick  < 2:
                     if curr['action'] == 'SELL':
-                        print('placed case 2, tick', tick)
-                        b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] 
+                        b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] + 0.1
+                        print('placed case 2, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
                         if curr['expires'] - tick  <= 0:
                             usedTenders.add(curr['tender_id'])
                     elif curr['action'] == 'BUY':
-                        print('placed case 2, tick', tick)
-                        b = marketBid - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer']
+                        b = marketBid - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer'] - 0.1
+                        print('placed case 2, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
                         if curr['expires'] - tick  <= 0:
                             usedTenders.add(curr['tender_id'])
@@ -202,18 +248,18 @@ def main():
                 # curr['expires'] means the tick number on which the tender expires
                 else:
                     if curr['action'] == 'SELL' and  curr['expires'] - tick  < 2:
-                        print('placed case 3, tick', tick)
                         b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer']
+                        print('placed case 3, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
                         usedTenders.add(curr['tender_id'])
                     elif curr['action'] == 'BUY' and curr['expires'] - tick  < 2:
-                        print('placed case 3, tick', tick)
                         b = marketBid - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer'] 
+                        print('placed case 3, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
                         usedTenders.add(curr['tender_id'])
 
             previous_tick = tick
-            flatten_positions(ticker_list)
+            flatten_positions(securities)
                     
         tick, status = get_tick()
 
