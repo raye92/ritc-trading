@@ -9,6 +9,7 @@ import os
 from dotenv import load_dotenv
 import requests
 from time import sleep
+from collections import defaultdict
 
 s = requests.Session()
 load_dotenv()
@@ -23,10 +24,10 @@ PRINT_HEART_BEAT= True
 
 LOW_VOL_BUFFER  = 0.04    # -> low volatility
 MED_VOL_BUFFER  = 0.14    # -> medium volatility
-HIGH_VOL_BUFFER = 0.50    # -> high volatility
+HIGH_VOL_BUFFER = 1.00    # -> high volatility
 
 LOW_LIQ   = 2_000         # -> low liquidity
-MED_LIQ   = 10_000        # -> medium liquidity
+MED_LIQ   = 5_000        # -> medium liquidity
 HIGH_LIQ  = 1_000_000       # -> high liquidity
 
 BASEURL ='http://localhost:9999/v1'
@@ -133,7 +134,6 @@ def placeBid(tenderID, bid):
 
 def lrg_mkt_order(ticker, action, quantity):
     quantity = int(quantity)
-    #print("LARGE MARKET ORDER", ticker, action, quantity)
     for i in range(quantity // ORDER_LIMIT):
         s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': action})
         quantity -= ORDER_LIMIT
@@ -150,44 +150,48 @@ def flatten_positions(securities):
 
 def setupSecurities():
     securities = {i['ticker']: i for i in s.get(BASEURL+ '/securities').json()}
-
     # SUB-HEAT 1
-    securities['RITC']['buffer'] = LOW_VOL_BUFFER
-    securities['RITC']['liquidity'] = MED_LIQ
-    securities['COMP']['buffer'] = MED_VOL_BUFFER
-    securities['COMP']['liquidity'] = HIGH_LIQ
+    if 'RITC' in securities:
+        securities['RITC']['buffer'] = LOW_VOL_BUFFER
+        securities['RITC']['liquidity'] = MED_LIQ
+        securities['COMP']['buffer'] = MED_VOL_BUFFER
+        securities['COMP']['liquidity'] = HIGH_LIQ
 
     # SUB-HEAT 2
-    securities['TRNT']['buffer'] = HIGH_VOL_BUFFER
-    securities['TRNT']['liquidity'] = MED_LIQ  
-    securities['MTRL']['buffer'] = LOW_VOL_BUFFER
-    securities['MTRL']['liquidity'] = LOW_LIQ
+    if 'TRNT' in securities: 
+        securities['TRNT']['buffer'] = HIGH_VOL_BUFFER
+        securities['TRNT']['liquidity'] = MED_LIQ  
+        securities['MTRL']['buffer'] = LOW_VOL_BUFFER
+        securities['MTRL']['liquidity'] = LOW_LIQ
     
     # SUB-HEAT 3
-    securities['BLU']['buffer'] = HIGH_VOL_BUFFER
-    securities['BLU']['liquidity'] = HIGH_LIQ      
-    securities['RED']['buffer'] = LOW_VOL_BUFFER
-    securities['RED']['liquidity'] = MED_LIQ          
-    securities['GRN']['buffer'] = MED_VOL_BUFFER
-    securities['GRN']['liquidity'] = MED_LIQ      
+    if 'BLU' in securities:
+        securities['BLU']['buffer'] = HIGH_VOL_BUFFER
+        securities['BLU']['liquidity'] = HIGH_LIQ      
+        securities['RED']['buffer'] = LOW_VOL_BUFFER
+        securities['RED']['liquidity'] = MED_LIQ          
+        securities['GRN']['buffer'] = MED_VOL_BUFFER
+        securities['GRN']['liquidity'] = MED_LIQ      
 
     # SUB-HEAT 4
-    securities['WDY']['buffer'] = MED_VOL_BUFFER
-    securities['WDY']['liquidity'] = HIGH_LIQ      
-    securities['BZZ']['buffer'] = HIGH_VOL_BUFFER
-    securities['BZZ']['liquidity'] = MED_LIQ     
-    securities['BNN']['buffer'] = MED_VOL_BUFFER
-    securities['BNN']['liquidity'] = MED_LIQ  
+    if 'WDY' in securities:
+        securities['WDY']['buffer'] = MED_VOL_BUFFER
+        securities['WDY']['liquidity'] = HIGH_LIQ      
+        securities['BZZ']['buffer'] = HIGH_VOL_BUFFER
+        securities['BZZ']['liquidity'] = MED_LIQ     
+        securities['BNN']['buffer'] = MED_VOL_BUFFER
+        securities['BNN']['liquidity'] = MED_LIQ  
 
     # SUB-HEAT 5
-    securities['VNS']['buffer'] = HIGH_VOL_BUFFER
-    securities['VNS']['liquidity'] = MED_LIQ     
-    securities['MRS']['buffer'] = MED_VOL_BUFFER
-    securities['MRS']['liquidity'] = HIGH_LIQ 
-    securities['JPTR']['buffer'] = LOW_VOL_BUFFER
-    securities['JPTR']['liquidity'] = MED_LIQ
-    securities['STRN']['buffer'] = HIGH_VOL_BUFFER
-    securities['STRN']['liquidity'] = MED_LIQ    
+    if 'VNS' in securities:
+        securities['VNS']['buffer'] = HIGH_VOL_BUFFER
+        securities['VNS']['liquidity'] = MED_LIQ     
+        securities['MRS']['buffer'] = MED_VOL_BUFFER
+        securities['MRS']['liquidity'] = HIGH_LIQ 
+        securities['JPTR']['buffer'] = LOW_VOL_BUFFER
+        securities['JPTR']['liquidity'] = MED_LIQ
+        securities['STRN']['buffer'] = HIGH_VOL_BUFFER
+        securities['STRN']['liquidity'] = MED_LIQ    
     return securities
 
 def main():
@@ -232,28 +236,27 @@ def main():
                 #case 2
                 elif caption[-1] == 'filled.' and curr['expires'] - tick  < 2:
                     if curr['action'] == 'SELL':
-                        b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] + 0.1
+                        b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] + 0.05
                         print('placed case 2, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
                         if curr['expires'] - tick  <= 0:
                             usedTenders.add(curr['tender_id'])
                     elif curr['action'] == 'BUY':
-                        b = marketBid - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer'] - 0.1
+                        b = marketBid - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer'] - 0.05
                         print('placed case 2, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
                         if curr['expires'] - tick  <= 0:
                             usedTenders.add(curr['tender_id'])
                 
                 #case 3
-                # curr['expires'] means the tick number on which the tender expires
                 else:
                     if curr['action'] == 'SELL' and  curr['expires'] - tick  < 2:
-                        b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer']
+                        b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] + 0.50
                         print('placed case 3, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
                         usedTenders.add(curr['tender_id'])
                     elif curr['action'] == 'BUY' and curr['expires'] - tick  < 2:
-                        b = marketBid - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer'] 
+                        b = marketBid - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer']  - 0.05
                         print('placed case 3, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
                         usedTenders.add(curr['tender_id'])
