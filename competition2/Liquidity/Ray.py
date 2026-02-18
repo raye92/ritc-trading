@@ -145,12 +145,12 @@ def lrg_mkt_order(ticker, action, quantity):
 def flatten_positions(ticker_list):
     
     for ticker_symbol in ticker_list:
-        if liquidity[ticker_symbol] == 'Low' or ticker_symbol == 'COMP' or ticker_symbol == 'RITC':
-            MAX_EXIT_EXPOSURE = 2000
+        if liquidity[ticker_symbol] == 'Low':
+            MAX_EXIT_EXPOSURE = 5000
         elif liquidity[ticker_symbol] == 'Medium':
-            MAX_EXIT_EXPOSURE = 50000
+            MAX_EXIT_EXPOSURE = 10000
         elif liquidity[ticker_symbol] == 'High':
-            MAX_EXIT_EXPOSURE = 100000
+            MAX_EXIT_EXPOSURE = 20000
             
         position = int(get_ind_position(ticker_symbol))
         if abs(position) > MAX_EXIT_EXPOSURE:
@@ -196,9 +196,9 @@ async def place_tender(tender, cost):
     market_bid, market_ask = get_bid_ask(tender['ticker'])
 
     if tender['action'] == 'SELL':
-        price = market_ask + cost
+        price = market_ask + cost + 0.08
     elif tender['action'] == 'BUY':
-        price = market_bid - cost
+        price = market_bid - cost - 0.08
     print("PRICE:", price, "Tick:", current_tick)
     amount = tender.get('quantity', tender.get('amount', ''))
     print(f"{current_tick},{tender['ticker']},{tender['action']},{amount},{market_bid},{market_ask}")
