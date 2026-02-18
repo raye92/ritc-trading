@@ -28,7 +28,7 @@ HIGH_VOL_BUFFER = 1.00    # -> high volatility
 
 LOW_LIQ   = 2_000         # -> low liquidity
 MED_LIQ   = 5_000        # -> medium liquidity
-HIGH_LIQ  = 1_000_000       # -> high liquidity
+HIGH_LIQ  = 20_000       # -> high liquidity
 
 BASEURL ='http://localhost:9999/v1'
 
