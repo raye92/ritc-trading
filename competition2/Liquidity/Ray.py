@@ -127,7 +127,7 @@ def get_position():
     resp = s.get ('http://localhost:9999/v1/securities')
     if resp.ok:
         book = resp.json()
-        return abs(book[0]['position']) + abs(book[1]['position'])
+        return abs(book[0]['position']) + abs(book[1]['position']) + abs(book[2]['position'])
 
 def accept_tender(tender):
     tender_id = tender['tender_id']
