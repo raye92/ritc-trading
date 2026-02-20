@@ -24,11 +24,11 @@ PRINT_HEART_BEAT= True
 
 LOW_VOL_BUFFER  = 0.04    # -> low volatility
 MED_VOL_BUFFER  = 0.14    # -> medium volatility
-HIGH_VOL_BUFFER = 0.50    # -> high volatility
+HIGH_VOL_BUFFER = 1.00    # -> high volatility
 
 LOW_LIQ   = 2_000         # -> low liquidity
 MED_LIQ   = 5_000        # -> medium liquidity
-HIGH_LIQ  = 10_000       # -> high liquidity
+HIGH_LIQ  = 20_000       # -> high liquidity
 
 BASEURL ='http://localhost:9999/v1'
 
@@ -132,24 +132,41 @@ def refuseTender(tenderID):
 def placeBid(tenderID, bid):
     r = s.post(f"{BASEURL}/tenders/{tenderID}", params= {"id": tenderID, "price": bid})
 
-def lrg_mkt_order(ticker, action, quantity):
+def lrg_mkt_order(ticker, action, quantity, price, total):
     quantity = int(quantity)
-    for i in range(quantity // ORDER_LIMIT):
+    tmp = total
+    if price is not None:
+        attempts = 0
+        while total > 0 and attempts < 100 * (total // ORDER_LIMIT):
+            amt = min(total , ORDER_LIMIT)
+            resp = s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'LIMIT', 'quantity': amt, 'action': action, 'price': price})
+            if resp:
+                total  -= resp.json()['quantity_filled']
+            attempts += 1
+        print("sold ", ((tmp - total) / tmp) * 100 ,"% at desired price ", total, " remaining")
+    quantity = max(0, quantity - (tmp-total))
+    for i in range(int(quantity) // ORDER_LIMIT):
         s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': action})
         quantity -= ORDER_LIMIT
-    if quantity != 0:
+    if quantity >= 0:
         s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': quantity, 'action': action})
+    
 
-def flatten_positions(securities):
+def flatten_positions(securities, desiredPrices):
     for ticker_symbol, values in securities.items():
-        position = int(get_ind_position(ticker_symbol))
+        price = desiredPrices[ticker_symbol]
+        total = position = int(get_ind_position(ticker_symbol))
+        if price is not None and total == 0:
+            continue
         if position > 0:
-            lrg_mkt_order(ticker_symbol, 'SELL', min(values['liquidity'], position))
+            lrg_mkt_order(ticker_symbol, 'SELL', min(values['liquidity'], position), price, total)
         elif position < 0:
-            lrg_mkt_order(ticker_symbol, 'BUY', min(values['liquidity'], abs(position)))
-
+            lrg_mkt_order(ticker_symbol, 'BUY', min(values['liquidity'], abs(position)), price, abs(total))
+    
 def setupSecurities():
     securities = {i['ticker']: i for i in s.get(BASEURL+ '/securities').json()}
+    desiredPrices = {i : None for i in securities.keys()}
+
     # SUB-HEAT 1
     if 'RITC' in securities:
         securities['RITC']['buffer'] = LOW_VOL_BUFFER
@@ -192,12 +209,11 @@ def setupSecurities():
         securities['JPTR']['liquidity'] = MED_LIQ
         securities['STRN']['buffer'] = HIGH_VOL_BUFFER
         securities['STRN']['liquidity'] = MED_LIQ    
-    return securities
+    return securities, desiredPrices
 
 def main():
     tick, status = get_tick()
-    securities = setupSecurities()
-
+    securities, desiredPrices = setupSecurities()
     usedTenders = set()
     previous_tick = -1
     last = -1
@@ -214,13 +230,10 @@ def main():
             if len(tenders) != last:
                 print(len(tenders))
                 last = len(tenders)
-
             # check for potential value 
             for curr in tenders:
                 caption = curr['caption'].split()
-                #print(caption)
                 marketBid, marketAsk = get_bid_ask(curr['ticker'])
-
                 #case 1
                 if curr['is_fixed_bid'] == True:
                     if curr['action'] == 'SELL':
@@ -228,43 +241,49 @@ def main():
                             print('placed case1, tick', tick, curr['ticker'])
                             acceptTender(curr['tender_id'])
                             usedTenders.add(curr['tender_id'])
+                            desiredPrices[curr['ticker']] = curr['price'] - 0.8*(curr['price']- marketAsk)
                     elif curr['action'] == 'BUY':
                         if curr['price'] + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] < marketBid:
                             print('placed case1, tick', tick, curr['ticker'])
                             acceptTender(curr['tender_id'])
                             usedTenders.add(curr['tender_id'])
+                            desiredPrices[curr['ticker']] = curr['price'] + 0.8*(marketBid - curr['price'])
                 #case 2
                 elif caption[-1] == 'filled.' and curr['expires'] - tick  < 2:
                     if curr['action'] == 'SELL':
                         b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] + 0.05
                         print('placed case 2, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
-                        if curr['expires'] - tick  <= 0:
-                            usedTenders.add(curr['tender_id'])
+                        usedTenders.add(curr['tender_id'])
+                        desiredPrices[curr['ticker']] = b - 0.8*(b- marketAsk)
                     elif curr['action'] == 'BUY':
                         b = marketBid - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer'] - 0.05
                         print('placed case 2, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
-                        if curr['expires'] - tick  <= 0:
-                            usedTenders.add(curr['tender_id'])
-                
+                        usedTenders.add(curr['tender_id'])
+                        desiredPrices[curr['ticker']] = b + 0.8*(marketBid - b)
                 #case 3
                 else:
                     if curr['action'] == 'SELL' and  curr['expires'] - tick  < 2:
                         b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] + 0.50
                         print('placed case 3, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
+                        desiredPrices[curr['ticker']] = b - 0.8*(b- marketAsk)
                         usedTenders.add(curr['tender_id'])
                     elif curr['action'] == 'BUY' and curr['expires'] - tick  < 2:
                         b = marketBid - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer']  - 0.05
                         print('placed case 3, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
+                        desiredPrices[curr['ticker']] = b + 0.8*(marketBid - b)
                         usedTenders.add(curr['tender_id'])
 
             previous_tick = tick
-            flatten_positions(securities)
+            flatten_positions(securities, desiredPrices)
+            resp = s.post(BASEURL + '/commands/cancel', params= {'all':1})
+
                     
         tick, status = get_tick()
 
 if __name__ == '__main__':
     main()
+
