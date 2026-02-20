@@ -136,7 +136,6 @@ def place_limit(ticker: str, action: str, qty: int, price: float):
 
 
 def place_market(ticker: str, action: str, qty: int):
-    qty = int(max(1, min(ORDER_LIMIT, qty)))
     return s.post(
         f"{BASEURL}/orders",
         params={"ticker": ticker, "type": "MARKET", "quantity": qty, "action": action},
@@ -184,8 +183,8 @@ def compute_quote_params(
         net_scale = 0.35 - (net_frac - 0.85) * (0.20 / 0.15)
 
     net_scale = clamp(net_scale, 0.10, 1.0)
-    gross_frac = clamp(abs(pos) / float(GROSSLIMIT), 0.0, 1.5)
-    flatten_bias = clamp((gross_frac - 0.60) / 0.35, 0.0, 1.0)  # 0 at 0.60, ~1 at 0.95+
+    gross_frac = clamp(agg_abs_pos / float(GROSSLIMIT), 0.0, 1.5)
+    flatten_bias = clamp((gross_frac - 0.60) / 0.35, 0.0, 1.0)  
 
     base_size = int(BASE_QUOTE_SIZE[ticker] * net_scale)
     base_size = max(MIN_QUOTE_SIZE, base_size)
@@ -274,14 +273,33 @@ def main():
             net_pos = sum([get_ind_position(tkr) for tkr in ticker_list])
             band = compute_band(agg_abs)
             minute_tick = tick % TICKS_PER_MINUTE
-            pre_close = minute_tick >= PRE_CLOSE_START and tick >= 20
-            post_close = minute_tick <= POST_CLOSE_END
 
             if PRINT_HEART_BEAT and tick != last_p_tick and tick % 10 == 0:
                 print(f"[tick={tick:>4}] band={band} agg_abs={agg_abs} minute_tick={minute_tick}")
                 for tkr in ticker_list:
                     cancel_all(tkr)
                 last_p_tick = tick
+            
+            for tkr in ticker_list:
+                if minute_tick > 54 and get_aggregate_abs_position() > MARKET_CLEAR_LIMIT:
+                    action = "SELL" if pos > 0 else "BUY"
+                    lrg_mkt_order(tkr, action, abs(pos))
+
+            if abs(net_pos) >= 25000:
+                long, short = 0, 0
+                longStocks, shortStocks = [], []
+                for tkr in ticker_list:
+                    pos = get_ind_position(tkr)
+                    if pos > 0:
+                        long += pos
+                        longStocks.append(tkr)
+                    elif pos < 0:
+                        short += abs(pos)
+                        shortStocks.append(tkr)
+                
+                action, arr = 'BUY', shortStocks if long > short else 'SELL' , longStocks
+                for tkr in arr:
+                    place_market(tkr, action, min(get_ind_position(tkr), int(4000 / len(arr))))
 
             for tkr in ticker_list:
                 best_bid, best_ask = get_bid_ask(tkr)
@@ -306,12 +324,9 @@ def main():
                         place_limit(tkr, "BUY", bid_q, bid_p)
                 if ask_q > 0:
                         place_limit(tkr, "SELL", ask_q, ask_p)
-                if band == "RED" and pre_close and get_aggregate_abs_position() > MARKET_CLEAR_LIMIT:
-                    action = "SELL" if pos > 0 else "BUY"
-                    lrg_mkt_order(tkr, action, abs(pos))
                 
             
-            print(get_aggregate_abs_position())
+            print(get_aggregate_abs_position())     
 
             print("Case status:", status)
         last_tick =  tick
