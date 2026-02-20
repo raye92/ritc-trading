@@ -205,8 +205,9 @@ def main():
                             
                         action = "BUY"
                         profit = ev - opt_ask - transaction_fee
-                        lrg_mkt_order(ticker, 'BUY', 1)
-                        total_portfolio_delta += delta_per_contract * 1 
+                        qty = max(1, int(profit * 10))
+                        lrg_mkt_order(ticker, 'BUY', qty)
+                        total_portfolio_delta += delta_per_contract * qty 
                             
                     elif ev < (opt_bid - threshold):
                         if option_count >= 1000 and current_position <= 0:
@@ -215,8 +216,9 @@ def main():
                             
                         action = "SELL"
                         profit = opt_bid - ev - transaction_fee
-                        lrg_mkt_order(ticker, 'SELL', 1)
-                        total_portfolio_delta -= delta_per_contract * 1 
+                        qty = max(1, int(profit * 10))
+                        lrg_mkt_order(ticker, 'SELL', qty)
+                        total_portfolio_delta -= delta_per_contract * qty 
 
                     if should_print and action != "HOLD":
                         diff = ev - (opt_bid + opt_ask) / 2.0
