@@ -5,6 +5,8 @@ import os
 from dotenv import load_dotenv
 import time
 import math
+import asyncio
+
 
 load_dotenv()
 
@@ -12,7 +14,29 @@ s = requests.Session()
 s.headers.update({'X-API-key': os.getenv('API_KEY')})
 
 ORDER_LIMIT = 10000
-MAX_EXPOSURE = 15000
+GROSS_LIMIT = 50000
+NET_LIMIT = 30000
+WEEKLY_LIMIT = None
+
+def getWeeklyLimit():
+    """Returns the weekly position limit from news (used as WEEKLY_LIMIT)."""
+    resp = s.get('http://localhost:9999/v1/news')
+    if resp.ok:
+        news = resp.json()
+        if news:
+            news_string = news[0]['body'].split()
+            for i in news_string:
+                if i.isdigit():
+                    return int(i)
+    return None
+
+def getTradingLimits():
+    resp = s.get('http://localhost:9999/v1/limits')
+    if resp.ok:
+        info = resp.json()
+        if info:
+            return info[0]['gross_limit'], info[0]['net_limit']
+    return None, None
 
 def get_tick():
     resp = s.get('http://localhost:9999/v1/case')
@@ -90,13 +114,75 @@ def get_order_status(order_id):
         order = resp.json()
         return order['status']
 
-def main():
+def lrg_mkt_order(ticker, action, quantity):
+    quantity = int(quantity)
+    for i in range(quantity // ORDER_LIMIT):
+        s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': action})
+        quantity -= ORDER_LIMIT
+    s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': quantity, 'action': action})
+
+async def async_spray(ticker, prices, ewma_vol, tick, current_individual_limit):
+    sec = prices.get(ticker, {})
+    best_bid = sec.get('bid')
+    best_ask = sec.get('ask')
+    pos = sec.get('position', 0)
+
+    agg_abs_pos = sum(abs(v['position']) for k, v in prices.items() if k != 'RTM')
+    net_pos = sum(v['position'] for k, v in prices.items() if k != 'RTM')
+
+    if best_bid is None or best_ask is None:
+        return
+
+    mid = 0.5 * (best_bid + best_ask)
+    TICK_SIZE = 0.01
+    spread = max(TICK_SIZE, best_ask - best_bid)
+
+    base_size = int(current_individual_limit * 0.1)
+    bid_qty = base_size
+    ask_qty = base_size
+    bid_price = best_bid - TICK_SIZE
+    ask_price = best_ask + TICK_SIZE
+
+    if bid_qty > 0:
+        await asyncio.to_thread(
+            s.post, 'http://localhost:9999/v1/orders',
+            params={'ticker': ticker, 'type': 'LIMIT', 'quantity': bid_qty, 'action': 'BUY', 'price': bid_price}
+        )
+
+    if ask_qty > 0:
+        await asyncio.to_thread(
+            s.post, 'http://localhost:9999/v1/orders',
+            params={'ticker': ticker, 'type': 'LIMIT', 'quantity': ask_qty, 'action': 'SELL', 'price': ask_price}
+        )
+
+def flatten_positions(ticker_list, prices):
+    for ticker_symbol in ticker_list:
+        position = int(prices.get(ticker_symbol, {}).get('position', 0))
+        limit = WEEKLY_LIMIT // 4
+        if position > limit:
+            lrg_mkt_order(ticker_symbol, 'SELL', position - limit)
+        elif position < -limit:
+            lrg_mkt_order(ticker_symbol, 'BUY', -(position + limit))
+
+async def main_loop():
+    global GROSS_LIMIT, NET_LIMIT, WEEKLY_LIMIT
     tick, status = get_tick()
-    ticker_list = [i['ticker'] for i in s.get('http://localhost:9999/v1/securities').json()]
+    ticker_list = [i['ticker'] for i in s.get('http://localhost:9999/v1/securities').json() if i['ticker'] != 'RTM']
     previous_tick = -1
     runs_per_tick = 0
 
-    # Wait for the case to actively start
+    limits = getTradingLimits()
+    if limits[0] is not None:
+        GROSS_LIMIT = limits[0]
+    if limits[1] is not None:
+        NET_LIMIT = limits[1]
+    wl = getWeeklyLimit()
+    if wl is not None:
+        WEEKLY_LIMIT = wl
+
+    CURRENT_INDIVIDUAL_LIMIT = NET_LIMIT // 4 if NET_LIMIT else 5000
+    ewma_vol_dict = {ticker: 0.30 for ticker in ticker_list}
+
     while status != 'ACTIVE':
         time.sleep(1)
         print(f"Game status is {status}. Waiting for the game to start...")
@@ -110,37 +196,25 @@ def main():
             runs_per_tick = 0
 
         if runs_per_tick < 20:
-            """closes all the positions at every 55 tick (in a minute) to avoid the position penalty"""
+            all_securities = s.get('http://localhost:9999/v1/securities').json()
+            prices = {sec['ticker']: sec for sec in all_securities}
+
             if tick % 60 >= 55:
-                for ticker_symbol in ticker_list:
-                    position = get_ind_position(ticker_symbol)
-
-                    if position > 0:
-                        s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': position, 'action': 'SELL'})
-                    elif position < 0:
-                        s.post('http://localhost:9999/v1/orders', params={'ticker': ticker_symbol, 'type': 'MARKET', 'quantity': abs(position), 'action': 'BUY'})
-
-            for i in range(len(ticker_list)):
-                ticker_symbol = ticker_list[i]
-                position = get_position()
-                best_bid_price, best_ask_price = get_bid_ask(ticker_symbol)
-
-                # Skip if book is empty
-                if best_bid_price is None or best_ask_price is None:
-                    continue
-
-                if position < MAX_EXPOSURE:
-                    resp = s.post('http://localhost:9999/v1/orders', params = {'ticker': ticker_symbol, 'type': 'LIMIT', 'quantity': ORDER_LIMIT, 'price': best_bid_price, 'action': 'BUY'})
-                    resp = s.post('http://localhost:9999/v1/orders', params = {'ticker': ticker_symbol, 'type': 'LIMIT', 'quantity': ORDER_LIMIT, 'price': best_ask_price, 'action': 'SELL'})
-
-                time.sleep(0.5)
-
-                s.post('http://localhost:9999/v1/commands/cancel', params = {'ticker': ticker_symbol})
+                flatten_positions(ticker_list, prices)
+            else:
+                tasks = [
+                    async_spray(tkr, prices, ewma_vol_dict[tkr], tick, CURRENT_INDIVIDUAL_LIMIT)
+                    for tkr in ticker_list
+                ]
+                await asyncio.gather(*tasks)
 
             runs_per_tick += 1
-            time.sleep(0.05)
+            await asyncio.sleep(0.05)
 
         tick, status = get_tick()
+
+def main():
+    asyncio.run(main_loop())
 
 if __name__ == '__main__':
     main()
