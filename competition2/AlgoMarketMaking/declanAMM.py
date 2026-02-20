@@ -1,14 +1,3 @@
-"""
-RITC 2026 Algorithmic Market Making Trading Case - REST API Basic Script
-Strategy:
-- Quote passively (LIMIT) on both sides to earn spread + rebates.
-- Inventory skew: if long, make ask more aggressive & bid less aggressive; vice versa if short.
-- Risk bands using aggregate abs position.
-- News-aware regime:
-    * Pre-close (last ~5 ticks of each minute): cancel risk-increasing orders and aim near-flat.
-    * Post-close (first ~2 ticks): widen / shrink size (or briefly pause) to avoid getting picked off.
-"""
-
 import os
 from time import sleep
 from dotenv import load_dotenv
@@ -26,46 +15,44 @@ def getLimitPosition():
     resp = s.get(f"{BASEURL}/news")
     if resp.ok:
         news = resp.json()
-    news_string = news[0]['body']
-    news_string = news_string.split()
-    for i in news_string:
-        if i.isdigit():
-            return int(i)
-        
+        if news:
+            news_string = news[0]['body'].split()
+            for i in news_string:
+                if i.isdigit():
+                    return int(i)
+    return 25000 # Fallback default
+
 def getTradingLimits():
     resp = s.get(f"{BASEURL}/limits")
     if resp.ok:
         info = resp.json()
-    grossLimit = info[0]['gross_limit']
-    netLimit = info[0]['net_limit']
-    return grossLimit, netLimit
-
-
+        grossLimit = info[0]['gross_limit']
+        netLimit = info[0]['net_limit']
+        return grossLimit, netLimit
+    return 100000, 25000 # Fallback default
 
 # Limits / parameters (tune per heat)
-MARKET_CLEAR_LIMIT = getLimitPosition()         # aggregate abs position cap target (risk-managed below this)
+MARKET_CLEAR_LIMIT = getLimitPosition()        # aggregate abs position cap target
 GROSSLIMIT, NETLIMIT = getTradingLimits()
 ORDER_LIMIT = 10_000          # max single order size
-BASE_QUOTE_SIZE = 2_500        # normal quote size per side
-BASE_QUOTE_SIZE = {'SPNG':1500,'SMMR':2500,'ATMN':2200, 'WNTR':3500 }
+BASE_QUOTE_SIZE_DICT = {'SPNG':1500, 'SMMR':2500, 'ATMN':2200, 'WNTR':3500}
 MIN_QUOTE_SIZE = 200          # smallest quote size
 
 # Quote shaping
 TICK_SIZE = 0.01
-BASE_HALF_SPREAD_TICKS = 1    # 1 tick each side as baselif ne
-MAX_SKEW_TICKS = 6            # max skew (ticks) when at +/- POS_CAP_PER_TICKER
+BASE_HALF_SPREAD_TICKS = 1    # 1 tick each side as baseline
+MAX_SKEW_TICKS = 6            # max skew (ticks)
 VOL_WIDEN_MULT = 10.0         # widens based on EWMA vol (scaled)
 EWMA_ALPHA = 0.25             # volatility smoothing
 
-# Timing / regimes (based on your tick%60 comment)
+# Timing / regimes
 TICKS_PER_MINUTE = 60
-PRE_CLOSE_START = 47          # tick%60 >= 55 => pre-close regime
+PRE_CLOSE_START = 47          
 POST_CLOSE_END = 15            
-
 
 PRINT_HEART_BEAT = True
 
-
+# -------------------- API Functions --------------------
 
 def get_tick():
     resp = s.get(f"{BASEURL}/case")
@@ -74,14 +61,12 @@ def get_tick():
         return case["tick"], case["status"]
     return None, None
 
-
 def get_ticker_list():
     resp = s.get(f"{BASEURL}/securities")
     if resp.ok:
         secs = resp.json()
         return [i["ticker"] for i in secs]
     return []
-
 
 def get_bid_ask(ticker: str):
     resp = s.get(f"{BASEURL}/securities/book", params={"ticker": ticker})
@@ -92,10 +77,7 @@ def get_bid_ask(ticker: str):
     asks = book.get("asks", [])
     if not bids or not asks:
         return None, None
-    best_bid = bids[0]["price"]
-    best_ask = asks[0]["price"]
-    return best_bid, best_ask
-
+    return bids[0]["price"], asks[0]["price"]
 
 def get_ind_position(ticker: str) -> int:
     resp = s.get(f"{BASEURL}/securities", params={"ticker": ticker})
@@ -109,10 +91,10 @@ def get_ind_position(ticker: str) -> int:
 def lrg_mkt_order(ticker, action, quantity):
     quantity = int(quantity)
     for i in range(quantity // ORDER_LIMIT):
-        s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': action})
+        s.post(f'{BASEURL}/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': ORDER_LIMIT, 'action': action})
         quantity -= ORDER_LIMIT
-    if quantity != 0:
-        s.post('http://localhost:9999/v1/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': quantity, 'action': action})
+    if quantity > 0:
+        s.post(f'{BASEURL}/orders', params={'ticker': ticker, 'type': 'MARKET', 'quantity': quantity, 'action': action})
 
 def get_aggregate_abs_position() -> int:
     resp = s.get(f"{BASEURL}/securities")
@@ -121,10 +103,29 @@ def get_aggregate_abs_position() -> int:
     secs = resp.json()
     return int(sum(abs(int(sec["position"])) for sec in secs))
 
+def get_open_orders():
+    resp = s.get(f"{BASEURL}/orders")
+    if resp.ok:
+        return resp.json()
+    return []
+
+def get_working_orders(ticker_list):
+    """Calculates lingering risk from orders that are still open."""
+    open_orders = get_open_orders()
+    working = {tkr: {'BUY': 0, 'SELL': 0} for tkr in ticker_list}
+    if not open_orders:
+        return working
+    for order in open_orders:
+        if order['status'] == 'OPEN':
+            tkr = order['ticker']
+            action = order['action']
+            remaining_qty = order['quantity'] - order['quantity_filled']
+            if tkr in working:
+                working[tkr][action] += remaining_qty
+    return working
 
 def cancel_all(ticker: str) -> None:
     s.post(f"{BASEURL}/commands/cancel", params={"ticker": ticker})
-
 
 def place_limit(ticker: str, action: str, qty: int, price: float):
     qty = int(max(1, min(ORDER_LIMIT, qty)))
@@ -134,66 +135,51 @@ def place_limit(ticker: str, action: str, qty: int, price: float):
         params={"ticker": ticker, "type": "LIMIT", "quantity": qty, "price": price, "action": action},
     )
 
-
 def place_market(ticker: str, action: str, qty: int):
     return s.post(
         f"{BASEURL}/orders",
         params={"ticker": ticker, "type": "MARKET", "quantity": qty, "action": action},
     )
 
-
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-
 def compute_band(agg_abs_pos: int):
-    if agg_abs_pos < 0.50 * NETLIMIT:
+    if agg_abs_pos < 0.50 * GROSSLIMIT:
         return "GREEN"
-    if agg_abs_pos < 0.7 * NETLIMIT:
+    if agg_abs_pos < 0.7 * GROSSLIMIT:
         return "YELLOW"
     return "RED"
 
+# -------------------- Core Logic --------------------
 
 def compute_quote_params(
-    ticker: str,
-    best_bid: float,
-    best_ask: float,
-    pos: int,
-    agg_abs_pos: int,
-    net_pos: int,
-    ewma_vol: float,
-    tick: int,
+    ticker: str, best_bid: float, best_ask: float, pos: int, agg_abs_pos: int, 
+    net_pos: int, working_buys: int, working_sells: int, ewma_vol: float, tick: int
 ):
-    """
-    Returns (bid_price, ask_price, bid_qty, ask_qty, mode)
-    """
-    mid = 0.5 * (best_bid + best_ask)
-    spread = max(TICK_SIZE, best_ask - best_bid)
-
     minute_tick = tick % TICKS_PER_MINUTE
     pre_close = minute_tick >= PRE_CLOSE_START and tick >= 20
     post_close = minute_tick <= POST_CLOSE_END and tick >= 20
     
-    net_frac = clamp(net_pos / float(NETLIMIT), 0.0, 1.5)
+    mid = 0.5 * (best_bid + best_ask)
+    
+    # Scaling logic based on limits
+    net_frac = clamp(abs(net_pos) / float(NETLIMIT), 0.0, 1.5)
     if net_frac < 0.70:
         net_scale = 1.0
     elif net_frac < 0.85:
         net_scale = 1.0 - (net_frac - 0.70) * (0.65 / 0.15)
     else:
         net_scale = 0.35 - (net_frac - 0.85) * (0.20 / 0.15)
-
     net_scale = clamp(net_scale, 0.10, 1.0)
+
     gross_frac = clamp(agg_abs_pos / float(GROSSLIMIT), 0.0, 1.5)
     flatten_bias = clamp((gross_frac - 0.60) / 0.35, 0.0, 1.0)  
 
-    base_size = int(BASE_QUOTE_SIZE[ticker] * net_scale)
-    base_size = max(MIN_QUOTE_SIZE, base_size)
+    base_size = BASE_QUOTE_SIZE_DICT.get(ticker, 2500) 
 
-    bid_qty = base_size
-    ask_qty = base_size
-
-    inc_side_scale   = 1.0 - flatten_bias       
-    flat_side_scale  = 1.0 + flatten_bias       
+    inc_side_scale   = net_scale * (1.0 - flatten_bias)       
+    flat_side_scale  = 1.0 + flatten_bias            
 
     if pos > 0:
         ask_qty = int(base_size * flat_side_scale)
@@ -201,27 +187,24 @@ def compute_quote_params(
     elif pos < 0:
         bid_qty = int(base_size * flat_side_scale)
         ask_qty = int(base_size * inc_side_scale)
-    
-    bid_qty = 0 if bid_qty < MIN_QUOTE_SIZE else min(bid_qty, ORDER_LIMIT)
-    ask_qty = 0 if ask_qty < MIN_QUOTE_SIZE else min(ask_qty, ORDER_LIMIT)
+    else:
+        bid_qty = ask_qty = int(base_size)
 
+    # Volatility and Skew Pricing
     widen_ticks = int(clamp(ewma_vol * VOL_WIDEN_MULT / TICK_SIZE, 0, 10))
     half_spread_ticks = BASE_HALF_SPREAD_TICKS + widen_ticks
-
-    pos_frac = clamp(pos / float(GROSSLIMIT), -1.0, 1.0)
+    pos_frac = clamp(pos / float(GROSSLIMIT/4), -1.0, 1.0)
     skew_ticks = int(round(pos_frac * MAX_SKEW_TICKS))
 
-    bid_offset_ticks = half_spread_ticks + max(0, skew_ticks)
-    ask_offset_ticks = half_spread_ticks - min(0, skew_ticks)  # if skew_ticks negative, ask_offset increases
+    bid_offset_ticks = half_spread_ticks + skew_ticks
+    ask_offset_ticks = half_spread_ticks - skew_ticks
 
-    if skew_ticks > 0:
-        ask_offset_ticks = max(1, half_spread_ticks - skew_ticks)
+    if bid_offset_ticks + ask_offset_ticks < 1:
+        ask_offset_ticks = 1 - bid_offset_ticks
 
-    if skew_ticks < 0:
-        bid_offset_ticks = max(1, half_spread_ticks + skew_ticks)  # skew_ticks is negative
-
-    bid_price = mid - bid_offset_ticks * TICK_SIZE
-    ask_price = mid + ask_offset_ticks * TICK_SIZE
+    # FIX: Removed the trailing comma that caused the Tuple bug
+    bid_price = round(mid - (bid_offset_ticks * TICK_SIZE), 2)
+    ask_price = round(mid + (ask_offset_ticks * TICK_SIZE), 2)
 
     if bid_price >= ask_price:
         bid_price = best_bid
@@ -241,13 +224,24 @@ def compute_quote_params(
             bid_price = min(best_ask - TICK_SIZE, mid - 0 * TICK_SIZE)
             bid_qty = max(MIN_QUOTE_SIZE, min(abs(pos), ORDER_LIMIT))
         else:
-            bid_qty = 0 
-            ask_qty = 0 
+            bid_qty = ask_qty = 0 
             bid_price = mid - (half_spread_ticks + 2) * TICK_SIZE
             ask_price = mid + (half_spread_ticks + 2) * TICK_SIZE
 
-    return bid_price, ask_price, bid_qty, ask_qty, mode
+    buy_headroom = NETLIMIT - (net_pos + working_buys)
+    sell_headroom = NETLIMIT - abs(net_pos - working_sells)
+    gross_headroom = GROSSLIMIT - (agg_abs_pos + working_buys + working_sells)
 
+    if bid_qty > 0:
+        bid_qty = int(max(0, min(bid_qty, buy_headroom, gross_headroom)))
+    if ask_qty > 0:
+        ask_qty = int(max(0, min(ask_qty, sell_headroom, gross_headroom)))
+
+    # Apply minimums and maximums
+    bid_qty = 0 if bid_qty < MIN_QUOTE_SIZE else min(bid_qty, ORDER_LIMIT)
+    ask_qty = 0 if ask_qty < MIN_QUOTE_SIZE else min(ask_qty, ORDER_LIMIT)
+
+    return bid_price, ask_price, bid_qty, ask_qty, mode
 
 def main():
     tick, status = get_tick()
@@ -261,7 +255,7 @@ def main():
 
     last_tick = -1
     last_p_tick = -1
-    print(MARKET_CLEAR_LIMIT, NETLIMIT, GROSSLIMIT, "MAX EXPOS, NETEXPOSE, GROSS")
+    print(f"MARKET CLEAR: {MARKET_CLEAR_LIMIT} | NET LIMIT: {NETLIMIT} | GROSS LIMIT: {GROSSLIMIT}")
 
     while status == "ACTIVE":
         tick, status = get_tick()
@@ -274,18 +268,22 @@ def main():
             band = compute_band(agg_abs)
             minute_tick = tick % TICKS_PER_MINUTE
 
-            if PRINT_HEART_BEAT and tick != last_p_tick and tick % 10 == 0:
-                print(f"[tick={tick:>4}] band={band} agg_abs={agg_abs} minute_tick={minute_tick}")
+            if tick != last_p_tick and tick % 10 == 0:
                 for tkr in ticker_list:
                     cancel_all(tkr)
+                print(f"[tick={tick:>4}] band={band} agg_abs={agg_abs} net={net_pos} minute_tick={minute_tick}")
                 last_p_tick = tick
             
+            # PRE-CLOSE MARKET CLEARING
             for tkr in ticker_list:
                 if minute_tick > 54 and get_aggregate_abs_position() > MARKET_CLEAR_LIMIT:
-                    action = "SELL" if pos > 0 else "BUY"
-                    lrg_mkt_order(tkr, action, abs(pos))
+                    pos = get_ind_position(tkr)
+                    if pos != 0:
+                        action = "SELL" if pos > 0 else "BUY"
+                        lrg_mkt_order(tkr, action, abs(pos))
 
-            if abs(net_pos) >= 25000:
+            # PROACTIVE PANIC FLATTENING (Triggered at 85% of Limit to prevent breach)
+            if abs(net_pos) >= (NETLIMIT * 0.85):
                 long, short = 0, 0
                 longStocks, shortStocks = [], []
                 for tkr in ticker_list:
@@ -297,11 +295,17 @@ def main():
                         short += abs(pos)
                         shortStocks.append(tkr)
                 
-                action, arr = 'BUY', shortStocks if long > short else 'SELL' , longStocks
+                action, arr = ('SELL', longStocks) if long > short else ('BUY', shortStocks)
                 for tkr in arr:
-                    place_market(tkr, action, min(get_ind_position(tkr), int(4000 / len(arr))))
+                    place_market(tkr, action, min(abs(get_ind_position(tkr)), int(4000 / max(1, len(arr)))))
 
+            # PREPARE WORKING ORDERS BEFORE QUOTING
+            working_orders = get_working_orders(ticker_list)
+
+            # QUOTING LOOP
             for tkr in ticker_list:
+                # Cancel open orders for this ticker every single tick to prevent layering
+
                 best_bid, best_ask = get_bid_ask(tkr)
                 if best_bid is None or best_ask is None:
                     continue
@@ -315,21 +319,20 @@ def main():
                 last_mid[tkr] = mid
 
                 pos = get_ind_position(tkr)
+                working_buys = working_orders[tkr]['BUY']
+                working_sells = working_orders[tkr]['SELL']
 
                 bid_p, ask_p, bid_q, ask_q, mode = compute_quote_params(
-                    tkr, best_bid, best_ask, pos, agg_abs, net_pos, ewma_vol[tkr], tick
+                    tkr, best_bid, best_ask, pos, agg_abs, net_pos, 
+                    working_buys, working_sells, ewma_vol[tkr], tick
                 )
 
                 if bid_q > 0:
-                        place_limit(tkr, "BUY", bid_q, bid_p)
+                    place_limit(tkr, "BUY", bid_q, bid_p)
                 if ask_q > 0:
-                        place_limit(tkr, "SELL", ask_q, ask_p)
-                
+                    place_limit(tkr, "SELL", ask_q, ask_p)
             
-            print(get_aggregate_abs_position())     
-
-            print("Case status:", status)
-        last_tick =  tick
+        last_tick = tick
 
 if __name__ == "__main__":
     main()
