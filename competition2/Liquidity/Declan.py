@@ -16,8 +16,6 @@ load_dotenv()
 APIKEY = os.getenv("API_KEY")
 s.headers.update({'X-API-key': APIKEY})
 
-
-MAX_EXPOSURE = 15000
 ORDER_LIMIT = 10_000
 MAX_TRADE_SIZE = 10_000
 PRINT_HEART_BEAT= True
@@ -26,9 +24,9 @@ LOW_VOL_BUFFER  = 0.04    # -> low volatility
 MED_VOL_BUFFER  = 0.14    # -> medium volatility
 HIGH_VOL_BUFFER = 0.50    # -> high volatility
 
-LOW_LIQ   = 2_000         # -> low liquidity
+LOW_LIQ   = 5_000         # -> low liquidity
 MED_LIQ   = 5_000        # -> medium liquidity
-HIGH_LIQ  = 10_000       # -> high liquidity
+HIGH_LIQ  = 20_000       # -> high liquidity
 
 BASEURL ='http://localhost:9999/v1'
 
@@ -201,6 +199,7 @@ def main():
     usedTenders = set()
     previous_tick = -1
     last = -1
+    safeSell, safeBuy = 0, 0
     while status == 'ACTIVE':
         if previous_tick != tick:
             # set up tender list 
@@ -225,11 +224,19 @@ def main():
                 if curr['is_fixed_bid'] == True:
                     if curr['action'] == 'SELL':
                         if curr['price'] - securities[curr['ticker']]['trading_fee'] - securities[curr['ticker']]['buffer'] > marketAsk:
+                            safeSell +=1
+                        else:
+                            safeSell = 0
+                        if safeSell >= 3:
                             print('placed case1, tick', tick, curr['ticker'])
                             acceptTender(curr['tender_id'])
                             usedTenders.add(curr['tender_id'])
                     elif curr['action'] == 'BUY':
                         if curr['price'] + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] < marketBid:
+                            safeBuy += 1
+                        else:
+                            safeBuy = 0
+                        if safeBuy >= 3:
                             print('placed case1, tick', tick, curr['ticker'])
                             acceptTender(curr['tender_id'])
                             usedTenders.add(curr['tender_id'])
@@ -251,7 +258,7 @@ def main():
                 #case 3
                 else:
                     if curr['action'] == 'SELL' and  curr['expires'] - tick  < 2:
-                        b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] + 0.50
+                        b = marketAsk + securities[curr['ticker']]['trading_fee'] + securities[curr['ticker']]['buffer'] + 0.05
                         print('placed case 3, tick,', tick, 'bid', b, curr['ticker'])
                         placeBid(curr['tender_id'], b)
                         usedTenders.add(curr['tender_id'])

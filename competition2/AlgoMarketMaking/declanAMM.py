@@ -7,7 +7,7 @@ import requests
 s = requests.Session()
 load_dotenv()
 APIKEY = os.getenv("API_KEY")
-s.headers.update({"X-API-key": APIKEY})
+s.headers.update({"X-API-key": "HL0MPJGJ"})
 
 BASEURL = "http://localhost:9999/v1"
 
